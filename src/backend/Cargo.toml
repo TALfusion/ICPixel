@@ -1,0 +1,18 @@
+[package]
+name = "backend"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+candid = "0.10"
+ic-cdk = "0.17"
+ic-cdk-timers = "0.11"
+ic-stable-structures = "0.6"
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+# PNG encoder for the /og.png http_request endpoint. Pure-Rust, builds for
+# wasm32-unknown-unknown without issue. Matches the nft canister's dep.
+png = "0.17"

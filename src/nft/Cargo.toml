@@ -1,0 +1,17 @@
+[package]
+name = "nft"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+candid = "0.10"
+ic-cdk = "0.17"
+ic-stable-structures = "0.6"
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+# PNG encoding for the http_request image endpoint. `png` pulls in
+# `miniz_oxide` for deflate. Both are pure-Rust and build for wasm32 fine.
+png = "0.17"

@@ -1,0 +1,142 @@
+type Subaccount = blob;
+
+type Account = record {
+  owner : principal;
+  subaccount : opt Subaccount;
+};
+
+type TokenMetadata = record {
+  name : text;
+  description : text;
+  alliance_id : nat64;
+  alliance_name : text;
+  season : nat32;
+  global_nft_number : nat64;
+  pixel_count : nat64;
+  width : nat16;
+  height : nat16;
+  x : int16;
+  y : int16;
+  template : vec nat32;
+  completed_at : nat64;
+  match_percent : nat8;
+};
+
+type MintArgs = record {
+  to : Account;
+  metadata : TokenMetadata;
+};
+
+type MintError = variant {
+  Unauthorized;
+  InvalidMetadata : text;
+  InternalError : text;
+};
+
+type MintResult = variant {
+  Ok : nat64;
+  Err : MintError;
+};
+
+type BurnError = variant {
+  NotFound;
+  NotOwner;
+  AlreadyBurned;
+};
+
+type BurnResult = variant {
+  Ok;
+  Err : BurnError;
+};
+
+type Value = variant {
+  Nat : nat;
+  Int : int;
+  Text : text;
+  Blob : blob;
+};
+
+type TransferArg = record {
+  from_subaccount : opt Subaccount;
+  to : Account;
+  token_id : nat64;
+  memo : opt blob;
+  created_at_time : opt nat64;
+};
+
+type TransferError = variant {
+  NonExistingTokenId;
+  InvalidRecipient;
+  Unauthorized;
+  TooOld;
+  CreatedInFuture : record { ledger_time : nat64 };
+  Duplicate : record { duplicate_of : nat64 };
+  GenericError : record { error_code : nat64; message : text };
+};
+
+type TransferResult = variant {
+  Ok : nat64;
+  Err : TransferError;
+};
+
+type TokenInfo = record {
+  token_id : nat64;
+  owner : Account;
+  pixel_count : nat64;
+  minted_at : nat64;
+};
+
+type HttpRequest = record {
+  method : text;
+  url : text;
+  headers : vec record { text; text };
+  body : blob;
+};
+
+type HttpResponse = record {
+  status_code : nat16;
+  headers : vec record { text; text };
+  body : blob;
+};
+
+type SetBackendResult = variant {
+  Ok;
+  Err : text;
+};
+
+service : {
+  // ─── Admin (controllers only) ───
+  set_backend_canister : (principal) -> (SetBackendResult);
+  get_backend_canister : () -> (opt principal) query;
+
+  // ─── Custom mint / burn ───
+  mint : (MintArgs) -> (MintResult);
+  burn : (nat64) -> (BurnResult);
+
+  // ─── ICRC-7 ───
+  icrc7_name : () -> (text) query;
+  icrc7_symbol : () -> (text) query;
+  icrc7_description : () -> (opt text) query;
+  icrc7_logo : () -> (opt text) query;
+  icrc7_total_supply : () -> (nat) query;
+  icrc7_supply_cap : () -> (opt nat) query;
+  icrc7_max_query_batch_size : () -> (opt nat) query;
+  icrc7_max_update_batch_size : () -> (opt nat) query;
+  icrc7_default_take_value : () -> (opt nat) query;
+  icrc7_max_take_value : () -> (opt nat) query;
+  icrc7_max_memo_size : () -> (opt nat) query;
+  icrc7_atomic_batch_transfers : () -> (opt bool) query;
+  icrc7_collection_metadata : () -> (vec record { text; Value }) query;
+  icrc7_owner_of : (vec nat64) -> (vec opt Account) query;
+  icrc7_balance_of : (vec Account) -> (vec nat) query;
+  icrc7_tokens : (opt nat64, opt nat) -> (vec nat64) query;
+  icrc7_tokens_of : (Account, opt nat64, opt nat) -> (vec nat64) query;
+  icrc7_token_metadata : (vec nat64) -> (vec opt vec record { text; Value }) query;
+  icrc7_transfer : (vec TransferArg) -> (vec opt TransferResult);
+
+  // ─── Treasury distribution support (called by backend) ───
+  list_season_tokens : (nat32, opt nat64, opt nat) -> (vec TokenInfo) query;
+
+  // ─── HTTP gateway ───
+  http_request : (HttpRequest) -> (HttpResponse) query;
+}

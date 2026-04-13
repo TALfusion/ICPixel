@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- Pixel-art favicon as inline SVG — works on all modern browsers and
+         degrades gracefully. Replace with a PNG/ICO set before launch if you
+         want crisper rendering on old Windows or pinned tabs. -->
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="theme-color" content="#0e0e14" />
+    <title>ICPixel WAR</title>
+    <meta
+      name="description"
+      content="Collaborative pixel battle on the Internet Computer. Place pixels, form alliances, mint NFTs of completed missions."
+    />
+
+    <!-- Open Graph — Facebook, LinkedIn, Discord, Telegram, most link previews.
+         NOTE: OG spec requires ABSOLUTE URLs, so the canister IDs below are
+         hardcoded as placeholders. deploy.sh substitutes real canister IDs
+         at build time via sed before `vite build`. -->
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="ICPixel WAR" />
+    <meta property="og:title" content="ICPixel WAR" />
+    <meta
+      property="og:description"
+      content="Collaborative pixel battle on the Internet Computer. Place pixels, form alliances, mint NFTs of completed missions."
+    />
+    <meta
+      property="og:url"
+      content="https://ICPIXEL_FRONTEND_HOST/"
+    />
+    <meta
+      property="og:image"
+      content="https://ICPIXEL_BACKEND_HOST/og.png"
+    />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="Live ICPixel WAR canvas" />
+
+    <!-- Twitter Card. summary_large_image gives the big-banner preview. -->
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="ICPixel WAR" />
+    <meta
+      name="twitter:description"
+      content="Collaborative pixel battle on the Internet Computer. Place pixels, form alliances, mint NFTs of completed missions."
+    />
+    <meta
+      name="twitter:image"
+      content="https://ICPIXEL_BACKEND_HOST/og.png"
+    />
+    <meta name="twitter:image:alt" content="Live ICPixel WAR canvas" />
+  </head>
+  <body style="margin:0;background:#111;color:#eee;font-family:system-ui,sans-serif">
+    <div id="root"></div>
+    <!-- Image-to-Pixel by Tezumie (MIT) — exposes window.pixelate -->
+    <script src="/image-to-pixel.js"></script>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

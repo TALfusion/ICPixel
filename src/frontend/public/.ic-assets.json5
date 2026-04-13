@@ -1,0 +1,11 @@
+// Security policy for the frontend asset canister.
+// Disabled locally: the "standard" policy sets connect-src 'self', which
+// blocks the ICP agent from reaching the replica / mainnet API endpoint.
+// We'll harden before mainnet launch with an explicit connect-src allowlist.
+[
+  {
+    "match": "**/*",
+    "security_policy": "disabled",
+    "disable_security_policy_warning": true
+  }
+]

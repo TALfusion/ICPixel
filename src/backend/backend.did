@@ -1,0 +1,335 @@
+type GameState = record {
+  map_size : nat16;
+  season : nat32;
+  total_pixels_placed : nat64;
+  unique_pixels_set : nat64;
+  final_stage_reached_at : opt nat64;
+  paused : bool;
+  treasury_balance_e8s : opt nat64;
+  treasury_last_distributed_season : opt nat32;
+  treasury_operational_buffer_e8s : opt nat64;
+  reward_pool_balance_e8s : opt nat64;
+};
+
+type DistributeReport = record {
+  season : nat32;
+  total_distributable_e8s : nat64;
+  owner_paid_e8s : nat64;
+  holders_pool_e8s : nat64;
+  holders_credited : nat32;
+  tokens_considered : nat32;
+};
+
+type DistributeTreasuryResult = variant { Ok : DistributeReport; Err : text };
+type ClaimTreasuryResult = variant { Ok : nat64; Err : text };
+
+type PlaceError = variant {
+  OutOfBounds;
+  InvalidColor;
+  SeasonEnded;
+  Unauthorized;
+  Cooldown : record { remaining_ns : nat64 };
+  NoCredits;
+  Paused;
+  InternalError : text;
+};
+
+type Billing = record {
+  alliance_price_e8s : nat64;
+  pixel_price_usd_cents : nat16;
+  pixel_cooldown_seconds : nat32;
+  ledger : opt principal;
+  wallet_principal : principal;
+  treasury_principal : principal;
+  wallet_pct : nat8;
+  treasury_pct : nat8;
+  reward_pool_pct : opt nat8;
+};
+
+type AdminStats = record {
+  cycles : nat64;
+  stable_pages : nat64;
+  low_cycles_warning : bool;
+  season : nat32;
+  map_size : nat16;
+  total_pixels_placed : nat64;
+  unique_pixels_set : nat64;
+  paused : bool;
+  pixel_price_usd_cents : nat16;
+  pixel_cooldown_seconds : nat32;
+  treasury_balance_e8s : nat64;
+  wallet_pending_e8s : nat64;
+  icp_usd_micro : nat64;
+  icp_usd_last_fetched_ns : nat64;
+  total_alliances : nat64;
+  total_users : nat64;
+  total_nfts_minted : nat64;
+};
+
+type UserStats = record {
+  current_streak : nat32;
+  max_streak : nat32;
+  last_day : nat32;
+  total_pixels : nat64;
+};
+
+type StreakEntry = record {
+  user : principal;
+  current_streak : nat32;
+  max_streak : nat32;
+  total_pixels : nat64;
+};
+
+type IcpUsdCache = record {
+  usd_per_icp_micro : nat64;
+  last_fetched_ns : nat64;
+};
+
+// HTTP gateway (certified-HTTP) request/response. Different shape than the
+// TransformHttpResponse above — these match the IC HTTP gateway spec, used
+// for serving content like /og.png via boundary-node URLs.
+type HttpGatewayRequest = record {
+  method : text;
+  url : text;
+  headers : vec record { text; text };
+  body : blob;
+};
+type HttpGatewayResponse = record {
+  status_code : nat16;
+  headers : vec record { text; text };
+  body : blob;
+};
+
+type BuyPixelsResult = variant { Ok : nat64; Err : text };
+type RefreshIcpPriceResult = variant { Ok : IcpUsdCache; Err : text };
+
+type PlaceResult = variant {
+  Ok;
+  Err : PlaceError;
+};
+
+type Mission = record {
+  x : int16;
+  y : int16;
+  width : nat16;
+  height : nat16;
+  template : vec nat32;
+};
+
+type Alliance = record {
+  id : nat64;
+  name : text;
+  description : text;
+  leader : principal;
+  members : vec principal;
+  mission : Mission;
+  created_at : nat64;
+  pixels_captured : nat64;
+  nft_token_id : opt nat64;
+  prev_nft_token_id : opt nat64;
+  nft_mint_in_progress : bool;
+};
+
+type AlliancePublic = record {
+  id : nat64;
+  name : text;
+  description : text;
+  leader : principal;
+  member_count : nat32;
+  created_at : nat64;
+  pixels_captured : nat64;
+  nft_token_id : opt nat64;
+};
+
+type AllianceError = variant {
+  Unauthorized;
+  NotFound;
+  AlreadyInAlliance;
+  NotInAlliance;
+  InvalidMission : text;
+  NameEmpty;
+  NameTooLong;
+  DescriptionTooLong;
+  NotLeader;
+  MissionNotComplete;
+  UpgradeMustContainOld;
+  OldPixelsModified;
+  MissionAreaAlreadyPainted : nat8;
+  NftCanisterNotConfigured;
+  NftMintFailed : text;
+  NftNotBurned;
+  PaymentFailed : text;
+  Paused;
+  InternalError : text;
+  RoundNotFound;
+  RoundNotCompleted;
+  NoContribution;
+  AlreadyClaimed;
+};
+
+type MissionRoundPublic = record {
+  round_index : nat32;
+  x : int16;
+  y : int16;
+  width : nat16;
+  height : nat16;
+  started_at : nat64;
+  completed_at : opt nat64;
+  pixel_count : nat64;
+  member_contributor_count : nat32;
+  helper_contributor_count : nat32;
+  credited_cells_count : nat64;
+  reward_pool_e8s : nat64;
+  claimed_count : nat32;
+  nft_token_id : opt nat64;
+};
+
+type MissionContributionView = record {
+  round_index : nat32;
+  completed : bool;
+  member_pixels : nat32;
+  helper_pixels : nat32;
+  my_weight : nat64;
+  total_weight : nat64;
+  reward_pool_e8s : nat64;
+  estimated_share_e8s : nat64;
+  claimed : bool;
+};
+
+type ClaimResult = record {
+  share_e8s : nat64;
+  transferred : bool;
+};
+
+type ClaimMissionRewardResult = variant { Ok : ClaimResult; Err : AllianceError };
+type MissionContributionResult = variant { Ok : MissionContributionView; Err : AllianceError };
+
+type SetBillingResult = variant { Ok; Err : text };
+
+type SetNftCanisterResult = variant { Ok; Err : text };
+
+type LeaderboardEntry = record {
+  rank : nat32;
+  alliance : AlliancePublic;
+};
+
+type LeaderboardPage = record {
+  entries : vec LeaderboardEntry;
+  total : nat64;
+  top_pixels : nat64;
+  my_entry : opt LeaderboardEntry;
+};
+
+type MissionStatus = record {
+  matched : nat32;
+  total : nat32;
+  percent : nat8;
+  completed : bool;
+};
+
+type CheckMissionResult = variant { Ok : MissionStatus; Err : AllianceError };
+
+type CreateAllianceResult = variant { Ok : nat64; Err : AllianceError };
+type AllianceUnitResult = variant { Ok; Err : AllianceError };
+
+type AllianceOrPublic = variant {
+  Full : Alliance;
+  Public : AlliancePublic;
+};
+
+type PixelChange = record {
+  x : int16;
+  y : int16;
+  color : nat32;
+};
+
+type ChangesResponse = record {
+  changes : vec PixelChange;
+  current_version : nat64;
+  min_version : nat64;
+  map_size : nat16;
+  next_version : nat64;
+};
+
+type VersionInfo = record {
+  version : nat64;
+  map_size : nat16;
+};
+
+service : {
+  place_pixel : (int16, int16, nat32) -> (PlaceResult);
+  get_map_chunk : (nat16, nat16) -> (vec nat32) query;
+  chunk_size : () -> (nat16) query;
+  get_game_state : () -> (GameState) query;
+  get_changes_since : (nat64, opt nat64) -> (ChangesResponse) query;
+  get_version : () -> (VersionInfo) query;
+
+  create_alliance : (text, text, Mission) -> (CreateAllianceResult);
+  join_alliance : (nat64) -> (AllianceUnitResult);
+  leave_alliance : () -> (AllianceUnitResult);
+  get_my_alliance : () -> (opt Alliance) query;
+  get_alliance : (nat64) -> (opt AllianceOrPublic) query;
+  list_alliances : () -> (vec AlliancePublic) query;
+  leaderboard : (nat64, nat64) -> (LeaderboardPage) query;
+  check_mission : (nat64) -> (CheckMissionResult) query;
+  upgrade_mission : (nat64, Mission) -> (AllianceUnitResult);
+
+  // Mission rounds & rewards.
+  get_mission_rounds : (nat64) -> (vec MissionRoundPublic) query;
+  my_mission_contribution : (nat64, nat32) -> (MissionContributionResult) query;
+  claim_mission_reward : (nat64, nat32) -> (ClaimMissionRewardResult);
+  get_treasury_balance : () -> (nat64) query;
+  admin_credit_treasury : (nat64) -> (variant { Ok : nat64; Err : text });
+
+  set_nft_canister : (principal) -> (SetNftCanisterResult);
+  get_nft_canister : () -> (opt principal) query;
+
+  get_alliance_billing : () -> (Billing) query;
+  get_alliance_price_usd_cents : () -> (nat16) query;
+  set_alliance_price : (nat64) -> (SetBillingResult);
+  set_alliance_billing : (Billing) -> (SetBillingResult);
+
+  admin_set_paused : (bool) -> (SetBillingResult);
+
+  // Health probe — open query, used by frontend admin badge and any
+  // external uptime monitor. cycles is the canister's current cycle
+  // balance; stable_pages is in 64KiB pages.
+  get_health : () -> (record {
+    cycles : nat64;
+    stable_pages : nat64;
+    low_cycles_warning : bool;
+  }) query;
+
+  get_pixel_credits : (principal) -> (nat64) query;
+  my_pixel_credits : () -> (nat64) query;
+  admin_grant_credits : (principal, nat64) -> (SetBillingResult);
+  buy_pixels : (nat64) -> (BuyPixelsResult);
+
+  // Batched wallet payout. Drains WALLET_PENDING_E8S via one icrc1_transfer
+  // to billing.wallet_principal. Returns the amount actually paid out
+  // (minus the ledger fee) or an error.
+  admin_payout_wallet : () -> (variant { Ok : nat64; Err : text });
+  get_wallet_pending_e8s : () -> (nat64) query;
+
+  // End-of-season treasury distribution.
+  distribute_treasury : () -> (DistributeTreasuryResult);
+  claim_treasury : () -> (ClaimTreasuryResult);
+  get_claimable_treasury : (principal) -> (nat64) query;
+  my_claimable_treasury : () -> (nat64) query;
+  admin_reset_treasury_distribution : () -> (SetBillingResult);
+  admin_set_treasury_buffer : (nat64) -> (SetBillingResult);
+
+  am_i_controller : () -> (bool) query;
+  get_admin_stats : () -> (AdminStats) query;
+
+  get_top_streaks : (nat64) -> (vec StreakEntry) query;
+  my_stats : () -> (UserStats) query;
+
+  refresh_icp_price : () -> (RefreshIcpPriceResult);
+  get_icp_price : () -> (IcpUsdCache) query;
+
+  // HTTP gateway endpoint — serves /og.png for link previews.
+  http_request : (HttpGatewayRequest) -> (HttpGatewayResponse) query;
+
+  debug_fill : (nat8) -> (nat64);
+}
