@@ -1,37 +1,15 @@
-# ICPixel WAR
+# ICPixel Documentation
 
-Collaborative pixel battle — fully on-chain on the [Internet Computer](https://internetcomputer.org/).
+Fully on-chain pixel battle game on the Internet Computer.
 
-## What is it
+## Pages
 
-A shared canvas where players place pixels, form alliances, and compete to complete pixel-art missions. Think r/place meets crypto.
-
-- Place pixels on a growing map (1×1 → 2048×2048)
-- Create alliances and set image missions at specific coordinates
-- Complete missions to earn unique NFTs
-- Season-based: map grows as players fill it, ends after reaching max size
-
-## Tech stack
-
-- **Backend**: Rust canister on ICP (Internet Computer Protocol)
-- **Frontend**: React + TypeScript, hosted as an IC asset canister
-- **NFTs**: ICRC-7 standard, fully on-chain (metadata + images)
-- **Payments**: ICP via ICRC-2
-- **Pricing**: IC Exchange Rate Canister (on-chain oracle)
-
-100% on-chain. No external servers, no databases, no cloud.
-
-## Getting started
-
-Requires [dfx](https://internetcomputer.org/docs/current/developer-docs/getting-started/install/), Rust, Node.js 18+.
-
-```bash
-dfx start --background
-./scripts/deploy.sh
-```
-
-Open the printed URL.
-
-## License
-
-All rights reserved.
+* [Overview](docs/overview.md) — What is ICPixel
+* [How to Play](docs/how-to-play.md) — Getting started guide
+* [Map & Seasons](docs/map-and-seasons.md) — Map growth, stages, season lifecycle
+* [Alliances & Missions](docs/alliances-and-missions.md) — Creating alliances, missions, upgrades
+* [Economy & Rewards](docs/economy-and-rewards.md) — Pricing, fee split, reward pool, claiming
+* [NFTs](docs/nfts.md) — Mission NFTs, metadata, treasury distribution
+* [Controls](docs/controls.md) — Keyboard shortcuts, mouse controls
+* [Architecture](docs/architecture.md) — Technical overview for developers
+* [FAQ](docs/faq.md) — Common questions
