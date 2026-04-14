@@ -195,7 +195,7 @@ pub fn list_season_tokens(
 ) -> Vec<TokenInfo> {
     let take_n = take
         .and_then(|n| n.0.try_into().ok())
-        .unwrap_or(500usize)
+        .unwrap_or(100usize)
         .min(1000);
     TOKENS.with(|t| {
         let map = t.borrow();
@@ -236,7 +236,7 @@ fn transfer_one(caller: candid::Principal, arg: TransferArg) -> TransferResult {
         };
         let owner = match &tok.owner {
             Some(o) => o.clone(),
-            None => return Err(TransferError::NonExistingTokenId),
+            None => return Err(TransferError::Unauthorized), // burned token
         };
         // Caller must be the principal in the owner account, and (if from_subaccount
         // was supplied) the subaccount must match.

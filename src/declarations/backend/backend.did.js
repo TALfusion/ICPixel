@@ -29,6 +29,7 @@ export const idlFactory = ({ IDL }) => {
     'NotLeader' : IDL.Null,
     'NftMintFailed' : IDL.Text,
     'UpgradeMustContainOld' : IDL.Null,
+    'InvalidWebsite' : IDL.Text,
     'InternalError' : IDL.Text,
     'AlreadyInAlliance' : IDL.Null,
   });
@@ -109,6 +110,7 @@ export const idlFactory = ({ IDL }) => {
     'name' : IDL.Text,
     'description' : IDL.Text,
     'created_at' : IDL.Nat64,
+    'website' : IDL.Opt(IDL.Text),
     'pixels_captured' : IDL.Nat64,
     'leader' : IDL.Principal,
     'member_count' : IDL.Nat32,
@@ -143,14 +145,18 @@ export const idlFactory = ({ IDL }) => {
   const GameState = IDL.Record({
     'final_stage_reached_at' : IDL.Opt(IDL.Nat64),
     'treasury_operational_buffer_e8s' : IDL.Opt(IDL.Nat64),
+    'test_radical_field' : IDL.Opt(IDL.Text),
     'total_pixels_placed' : IDL.Nat64,
     'season' : IDL.Nat32,
     'treasury_last_distributed_season' : IDL.Opt(IDL.Nat32),
+    'last_completed_mission_name' : IDL.Opt(IDL.Text),
+    'test_big_number' : IDL.Opt(IDL.Nat64),
     'unique_pixels_set' : IDL.Nat64,
     'reward_pool_balance_e8s' : IDL.Opt(IDL.Nat64),
     'treasury_balance_e8s' : IDL.Opt(IDL.Nat64),
     'map_size' : IDL.Nat16,
     'paused' : IDL.Bool,
+    'last_completed_mission_at' : IDL.Opt(IDL.Nat64),
   });
   const IcpUsdCache = IDL.Record({
     'last_fetched_ns' : IDL.Nat64,
@@ -277,7 +283,7 @@ export const idlFactory = ({ IDL }) => {
       ),
     'claim_treasury' : IDL.Func([], [ClaimTreasuryResult], []),
     'create_alliance' : IDL.Func(
-        [IDL.Text, IDL.Text, Mission],
+        [IDL.Text, IDL.Text, Mission, IDL.Text],
         [CreateAllianceResult],
         [],
       ),

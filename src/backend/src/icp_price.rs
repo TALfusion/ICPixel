@@ -158,6 +158,20 @@ pub fn raw() -> IcpUsdCache {
     crate::state::ICP_USD_CACHE.with(|c| c.borrow().get().clone())
 }
 
+/// Emergency admin override: set the cached ICP/USD rate manually.
+/// Use when XRC is down for an extended period. The rate will be treated
+/// as fresh (timestamped now) and will be overwritten on the next
+/// successful XRC refresh.
+pub fn admin_set_override(usd_per_icp_micro: u64) {
+    let cache = IcpUsdCache {
+        usd_per_icp_micro,
+        last_fetched_ns: ic_cdk::api::time(),
+    };
+    crate::state::ICP_USD_CACHE.with(|c| {
+        let _ = c.borrow_mut().set(cache);
+    });
+}
+
 /// Compute how many e8s equal `cents` USD cents, using the current rate.
 /// Returns None if there's no fresh rate cached.
 pub fn cents_to_e8s(cents: u16) -> Option<u64> {

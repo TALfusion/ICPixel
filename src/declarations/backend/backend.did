@@ -9,6 +9,10 @@ type GameState = record {
   treasury_last_distributed_season : opt nat32;
   treasury_operational_buffer_e8s : opt nat64;
   reward_pool_balance_e8s : opt nat64;
+  test_radical_field : opt text;
+  test_big_number : opt nat64;
+  last_completed_mission_name : opt text;
+  last_completed_mission_at : opt nat64;
 };
 
 type DistributeReport = record {
@@ -139,6 +143,7 @@ type AlliancePublic = record {
   created_at : nat64;
   pixels_captured : nat64;
   nft_token_id : opt nat64;
+  website : opt text;
 };
 
 type AllianceError = variant {
@@ -165,6 +170,7 @@ type AllianceError = variant {
   RoundNotCompleted;
   NoContribution;
   AlreadyClaimed;
+  InvalidWebsite : text;
 };
 
 type MissionRoundPublic = record {
@@ -264,7 +270,7 @@ service : {
   get_changes_since : (nat64, opt nat64) -> (ChangesResponse) query;
   get_version : () -> (VersionInfo) query;
 
-  create_alliance : (text, text, Mission) -> (CreateAllianceResult);
+  create_alliance : (text, text, Mission, text) -> (CreateAllianceResult);
   join_alliance : (nat64) -> (AllianceUnitResult);
   leave_alliance : () -> (AllianceUnitResult);
   get_my_alliance : () -> (opt Alliance) query;

@@ -48,7 +48,7 @@ pub fn upgrade_mission(
     let mut alliance = ALLIANCES
         .with(|a| a.borrow().get(&id))
         .ok_or(AllianceError::NotFound)?;
-    if alliance.leader != caller {
+    if alliance.leader != caller || !alliance.members.contains(&caller) {
         return Err(AllianceError::NotLeader);
     }
     if !check_mission(id)?.completed {
@@ -88,6 +88,11 @@ pub fn upgrade_mission(
         for col in 0..ow {
             let old_idx = row * ow + col;
             let new_idx = (dy + row) * nw + (dx + col);
+            if new_idx >= new_mission.template.len() {
+                return Err(AllianceError::InvalidMission(
+                    "new template too small to contain old pixels".into(),
+                ));
+            }
             if new_mission.template[new_idx] != old.template[old_idx] {
                 return Err(AllianceError::OldPixelsModified);
             }
@@ -152,6 +157,7 @@ pub async fn create_alliance(
     name: String,
     description: String,
     mission: Mission,
+    website: String,
     now_ns: u64,
 ) -> Result<AllianceId, AllianceError> {
     if crate::state::game_state().paused {
@@ -169,6 +175,23 @@ pub async fn create_alliance(
     if description.chars().count() > MAX_ALLIANCE_DESCRIPTION_CHARS {
         return Err(AllianceError::DescriptionTooLong);
     }
+    // Validate optional website: empty string = no website; otherwise must
+    // start with "https://" and be ≤ 200 chars.
+    let website_opt = if website.is_empty() {
+        None
+    } else {
+        if !website.starts_with("https://") {
+            return Err(AllianceError::InvalidWebsite(
+                "must start with https://".into(),
+            ));
+        }
+        if website.chars().count() > 200 {
+            return Err(AllianceError::InvalidWebsite(
+                "must be ≤ 200 characters".into(),
+            ));
+        }
+        Some(website)
+    };
     if USER_ALLIANCE.with(|u| u.borrow().contains_key(&caller)) {
         return Err(AllianceError::AlreadyInAlliance);
     }
@@ -219,6 +242,7 @@ pub async fn create_alliance(
         nft_token_id: None,
         prev_nft_token_id: None,
         nft_mint_in_progress: false,
+        website: website_opt,
     };
 
     ALLIANCES.with(|a| a.borrow_mut().insert(id, alliance.clone()));
@@ -401,6 +425,12 @@ fn validate_mission(m: &Mission) -> Result<(), AllianceError> {
         ));
     }
     let expected = (m.width as usize) * (m.height as usize);
+    const MAX_TEMPLATE_CELLS: usize = 62_500; // 250×250
+    if expected > MAX_TEMPLATE_CELLS {
+        return Err(AllianceError::InvalidMission(format!(
+            "mission too large: {expected} cells (max {MAX_TEMPLATE_CELLS})"
+        )));
+    }
     if m.template.len() != expected {
         return Err(AllianceError::InvalidMission(format!(
             "template length {} != width*height {}",
@@ -957,6 +987,16 @@ pub async fn maybe_mint_for_pixel(x: i16, y: i16) {
                 if let Some(round) = rounds.last_mut() {
                     round.nft_token_id = Some(*token_id);
                 }
+            });
+        }
+        if let Ok(_token_id) = &mint_result {
+            // Record last completed mission in GameState for frontend banner.
+            crate::state::GAME_STATE.with(|gs| {
+                let mut cell = gs.borrow_mut();
+                let mut state = cell.get().clone();
+                state.last_completed_mission_name = Some(alliance.name.clone());
+                state.last_completed_mission_at = Some(ic_cdk::api::time());
+                let _ = cell.set(state);
             });
         }
         if let Err(e) = mint_result {

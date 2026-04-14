@@ -71,12 +71,14 @@ async fn create_alliance(
     name: String,
     description: String,
     mission: Mission,
+    website: String,
 ) -> Result<AllianceId, AllianceError> {
     alliance::create_alliance(
         caller_or_anon(),
         name,
         description,
         mission,
+        website,
         ic_cdk::api::time(),
     )
     .await
@@ -574,6 +576,20 @@ async fn refresh_icp_price() -> Result<icp_price::IcpUsdCache, String> {
     icp_price::refresh().await
 }
 
+/// Emergency override for ICP/USD rate when XRC is down.
+/// Accepts micro-USD (e.g. 12_500_000 = $12.50 per ICP).
+#[update]
+fn admin_set_icp_price_override(usd_per_icp_micro: u64) -> Result<(), String> {
+    if !ic_cdk::api::is_controller(&ic_cdk::caller()) {
+        return Err("only controllers".into());
+    }
+    if usd_per_icp_micro == 0 {
+        return Err("rate must be > 0".into());
+    }
+    icp_price::admin_set_override(usd_per_icp_micro);
+    Ok(())
+}
+
 #[query]
 fn get_icp_price() -> icp_price::IcpUsdCache {
     icp_price::raw()
@@ -668,6 +684,17 @@ fn post_upgrade() {
 /// expensive XRC refresh.
 fn arm_icp_price_timer() {
     use std::time::Duration;
+    // Immediate one-shot: refresh ICP price + ledger fee on startup so the
+    // cache isn't stale right after an upgrade.
+    ic_cdk_timers::set_timer(Duration::ZERO, || {
+        ic_cdk::spawn(async {
+            let _ = icp_price::refresh().await;
+            let cfg = billing::get();
+            if let Some(ledger) = cfg.ledger {
+                let _ = icp_ledger::refresh_ledger_fee(ledger).await;
+            }
+        });
+    });
     // XRC refresh — every 6 hours.
     ic_cdk_timers::set_timer_interval(Duration::from_secs(12 * 60 * 60), || {
         ic_cdk::spawn(async {

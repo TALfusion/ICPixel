@@ -25,6 +25,26 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+# ── Pre-deploy safety snapshot ────────────────────────────────────────
+# Takes a canister snapshot of backend and nft BEFORE deploying. If the
+# upgrade breaks something, you can roll back with:
+#   dfx canister snapshot load <canister> <snapshot-id>
+#
+# Snapshots are cheap (only delta from current state) and local replica
+# supports them since dfx 0.24+. On mainnet they require the canister
+# to have the caller as a controller.
+for canister in backend nft; do
+  cid=$(dfx canister id "$canister" 2>/dev/null || true)
+  if [[ -n "$cid" ]]; then
+    snap=$(dfx canister snapshot create "$canister" 2>&1 || true)
+    if echo "$snap" | grep -q "snapshot_id\|Created"; then
+      echo "📸 snapshot $canister: $snap"
+    else
+      echo "⚠  snapshot $canister skipped (${snap})"
+    fi
+  fi
+done
+
 echo "▶ dfx deploy $*"
 dfx deploy "$@"
 

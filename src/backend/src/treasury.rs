@@ -172,21 +172,10 @@ pub async fn distribute_treasury(
         return Err("total weight is zero — no tokens to credit".into());
     }
 
-    // Pay owner first so a holder credit failure doesn't strand owner cut.
-    let owner_paid = if owner_cut > 0 {
-        crate::icp_ledger::transfer_drain(ledger, owner_principal, owner_cut).await?
-    } else {
-        0
-    };
-
-    // Synchronous block: write all credits at once. No awaits between
-    // reads and writes so concurrent claim_treasury calls can't observe
-    // a half-distributed state.
-    //
-    // Rounding: each per-principal share is `pool * weight / total_weight`,
-    // floored. Sub-e8 dust from each holder accumulates as a small
-    // residual in the canister's ICP balance — kept on hand as part of
-    // the operational buffer, distributed in the next season.
+    // Credit holders FIRST (synchronous, no awaits). This ensures that if
+    // the subsequent owner transfer fails, credits are already written and
+    // the admin can retry without double-crediting holders (saturating_add)
+    // and without double-paying the owner.
     let pool_u128 = holders_pool as u128;
     let mut holders_credited: u32 = 0;
     CLAIMABLE_TREASURY.with(|m| {
@@ -201,6 +190,13 @@ pub async fn distribute_treasury(
             holders_credited += 1;
         }
     });
+
+    // Pay owner AFTER holder credits are safely persisted.
+    let owner_paid = if owner_cut > 0 {
+        crate::icp_ledger::transfer_drain(ledger, owner_principal, owner_cut).await?
+    } else {
+        0
+    };
 
     Ok(DistributeReport {
         season,

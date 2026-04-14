@@ -368,6 +368,22 @@ export default function Dashboard({ actor, initialState, alliances, onPlay }: Da
                     {e.alliance.nft_token_id.length > 0 && (
                       <span className="dash-nft-badge">NFT #{String(e.alliance.nft_token_id[0])}</span>
                     )}
+                    {e.alliance.nft_token_id.length > 0 && e.alliance.website && e.alliance.website.length > 0 && (
+                      <a
+                        href={e.alliance.website[0]}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        onClick={(ev) => {
+                          if (!window.confirm(`You are leaving ICPixel to visit:\n\n${e.alliance.website![0]}\n\nThis is an external link not controlled by ICPixel. Proceed?`)) {
+                            ev.preventDefault();
+                          }
+                        }}
+                        className="dash-nft-badge"
+                        style={{ textDecoration: "none", cursor: "pointer" }}
+                      >
+                        🔗 website
+                      </a>
+                    )}
                   </div>
                   );
                 })}

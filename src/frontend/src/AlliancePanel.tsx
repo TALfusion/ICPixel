@@ -723,6 +723,7 @@ export default function AlliancePanel({
 
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
+  const [website, setWebsite] = useState("");
   const [previewTemplate, setPreviewTemplate] = useState<number[] | null>(null);
 
   // Callback for MissionImageCrop → feeds into the same previewTemplate
@@ -759,12 +760,13 @@ export default function AlliancePanel({
     setBusy(true);
     try {
       const mission: Mission = { ...pendingRect, template: previewTemplate };
-      const res = await actor.create_alliance(name, description, mission);
+      const res = await actor.create_alliance(name, description, mission, website);
       if ("Err" in res) {
         setErr(fmtError(res.Err));
       } else {
         setName("");
         setDescription("");
+        setWebsite("");
         setPreviewTemplate(null);
         onClearRect();
         setCreating(false);
@@ -1255,6 +1257,13 @@ export default function AlliancePanel({
               onChange={(e) => setDescription(e.target.value)}
               maxLength={500}
               style={{ ...styles.input, minHeight: 50, resize: "vertical" }}
+            />
+            <input
+              placeholder="Website (optional, https://...)"
+              value={website}
+              onChange={(e) => setWebsite(e.target.value)}
+              maxLength={200}
+              style={styles.input}
             />
 
             <div style={styles.step}>

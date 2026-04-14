@@ -208,7 +208,10 @@ pub fn init_pixel_colors() {
         let needed_pages = (FLAT_PIXEL_BYTES + 65535) / 65536;
         let current = mem.size();
         if current < needed_pages {
-            mem.grow(needed_pages - current);
+            let prev = mem.grow(needed_pages - current);
+            if prev == -1 {
+                ic_cdk::trap("init_pixel_colors: failed to grow stable memory");
+            }
         }
     });
 }

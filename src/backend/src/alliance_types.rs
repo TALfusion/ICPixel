@@ -52,6 +52,11 @@ pub struct Alliance {
     // the same mission. Cleared after the call returns (success or fail).
     #[serde(default)]
     pub nft_mint_in_progress: bool,
+
+    /// Optional website URL for the alliance. Must start with "https://"
+    /// and be ≤ 200 chars if set. Option for upgrade-safety per MIGRATION.md.
+    #[serde(default)]
+    pub website: Option<String>,
 }
 
 /// Public view (no mission) — what non-members see in `list_alliances`.
@@ -66,6 +71,8 @@ pub struct AlliancePublic {
     pub pixels_captured: u64,
     #[serde(default)]
     pub nft_token_id: Option<u64>,
+    #[serde(default)]
+    pub website: Option<String>,
 }
 
 impl Alliance {
@@ -79,6 +86,7 @@ impl Alliance {
             created_at: self.created_at,
             pixels_captured: self.pixels_captured,
             nft_token_id: self.nft_token_id,
+            website: self.website.clone(),
         }
     }
 }
@@ -130,6 +138,8 @@ pub enum AllianceError {
     NoContribution,
     // Caller has already claimed this round.
     AlreadyClaimed,
+    // Website URL is invalid (must be https:// and ≤ 200 chars).
+    InvalidWebsite(String),
 }
 
 /// One entry in a leaderboard page. `rank` is 1-based, computed by sorting

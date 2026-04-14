@@ -123,6 +123,17 @@ pub struct GameState {
     /// upgrade-safety per MIGRATION.md.
     #[serde(default)]
     pub reward_pool_balance_e8s: Option<u64>,
+
+    /// Name of the last alliance whose mission was completed and NFT minted.
+    /// Updated by `maybe_mint_for_pixel` on successful mint. Option per
+    /// MIGRATION.md.
+    #[serde(default)]
+    pub last_completed_mission_name: Option<String>,
+
+    /// Timestamp (ns) when the last mission was completed (NFT minted).
+    /// Option per MIGRATION.md.
+    #[serde(default)]
+    pub last_completed_mission_at: Option<u64>,
 }
 
 impl Default for GameState {
@@ -138,6 +149,8 @@ impl Default for GameState {
             treasury_last_distributed_season: None,
             treasury_operational_buffer_e8s: None,
             reward_pool_balance_e8s: None,
+            last_completed_mission_name: None,
+            last_completed_mission_at: None,
         }
     }
 }
@@ -150,7 +163,7 @@ impl Storable for GameState {
         candid::decode_one(&bytes).expect("decode GameState")
     }
     const BOUND: Bound = Bound::Bounded {
-        max_size: 512,
+        max_size: 1024,
         is_fixed_size: false,
     };
 }

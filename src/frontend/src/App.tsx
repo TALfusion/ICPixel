@@ -276,7 +276,7 @@ export default function App() {
   // Whether the create-alliance form is open. Pending rect overlay only
   // renders when this is true.
   const [creatingAlliance, setCreatingAlliance] = useState(false);
-  const [panelOpen, setPanelOpen] = useState(true);
+  const [panelOpen, setPanelOpen] = useState(false);
   const [panelTab, setPanelTab] = useState<"mine" | "leaderboard">("mine");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [showFullPrincipal, setShowFullPrincipal] = useState(false);
@@ -297,8 +297,7 @@ export default function App() {
   const [status, setStatus] = useState<string>("loading...");
 
   const [authed, setAuthed] = useState(false);
-  // TODO: gate admin tab to controllers only before mainnet
-  const [, setIsController] = useState(false);
+  const [isController, setIsController] = useState(false);
 
   // ── View-only / sign-in gating ────────────────────────────────────
   //
@@ -387,6 +386,8 @@ export default function App() {
   const [shopOpen, setShopOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
   const [howToPlay, setHowToPlay] = useState(false);
+  const [showPrivacy, setShowPrivacy] = useState(false);
+  const [showTerms, setShowTerms] = useState(false);
   const [shopBusy, setShopBusy] = useState(false);
   // Two-step pack flow: (1) click a pack → stash the count in
   // `shopDepositPack` and switch the modal to the deposit view;
@@ -588,6 +589,23 @@ export default function App() {
     }
     return { matched, total, percent: total ? matched / total : 0 };
   }, [map, myAlliance, state]);
+
+  // ── Global mission completion banner ───────────────────────────────
+  // Shows "Alliance X completed their mission!" to ALL players when any
+  // alliance's NFT is minted. Detects by comparing last_completed_mission_at
+  // in GameState across polls.
+  const [missionBanner, setMissionBanner] = useState<string | null>(null);
+  const lastSeenCompletionRef = useRef<bigint>(0n);
+  useEffect(() => {
+    if (!state) return;
+    const at = state.last_completed_mission_at?.[0] ?? 0n;
+    const name = state.last_completed_mission_name?.[0] ?? null;
+    if (at > 0n && at > lastSeenCompletionRef.current && name) {
+      lastSeenCompletionRef.current = at;
+      setMissionBanner(name);
+      window.setTimeout(() => setMissionBanner(null), 8000);
+    }
+  }, [state?.last_completed_mission_at?.[0]]);
 
   // Fanfare + confetti on first crossing of 95%.
   const [confetti, setConfetti] = useState(false);
@@ -1972,22 +1990,15 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state?.map_size]);
 
-  // ── First-visit welcome toast ───────────────────────────────────
-  const [welcome, setWelcome] = useState<boolean>(() => {
-    try {
-      return localStorage.getItem("icpixel_welcomed") !== "1";
-    } catch {
-      return false;
-    }
-  });
+  // ── First-visit: open help modal automatically ──────────────────
   useEffect(() => {
-    if (!welcome) return;
     try {
-      localStorage.setItem("icpixel_welcomed", "1");
+      if (localStorage.getItem("icpixel_welcomed") !== "1") {
+        localStorage.setItem("icpixel_welcomed", "1");
+        setHelpOpen(true);
+      }
     } catch {}
-    const t = window.setTimeout(() => setWelcome(false), 6000);
-    return () => window.clearTimeout(t);
-  }, [welcome]);
+  }, []);
 
   // Bumps every time we want to play the cursor-shake animation. Used as
   // React key on the hover ring so the animation restarts cleanly.
@@ -2113,41 +2124,34 @@ export default function App() {
         >
           <div
             style={{
-              background: "linear-gradient(135deg, #2a4fd8, #3b6cff)",
-              color: "#fff",
+              background: "rgba(22, 22, 26, 0.85)",
+              color: "#e8e8ec",
               padding: "10px 18px",
               borderRadius: 999,
               fontSize: 13,
               fontWeight: 600,
               boxShadow: "0 8px 24px rgba(0,0,0,0.5)",
+              border: "1px solid #2a2a32",
+              display: "flex",
+              alignItems: "center",
+              gap: 8,
             }}
           >
-            🌱 the map is growing…
+            <img src="/img/logo.svg" alt="" style={{ width: 16, height: 16, animation: "spin 2s linear infinite" }} />
+            the map is growing…
           </div>
         </div>
       )}
-      {welcome && (
-        <div
-          onClick={() => setWelcome(false)}
-          style={{
-            position: "fixed",
-            top: 60,
-            left: "50%",
-            transform: "translateX(-50%)",
-            background: "linear-gradient(135deg, #2a4fd8, #3b6cff)",
-            color: "#fff",
-            padding: "12px 20px",
-            borderRadius: 10,
-            fontSize: 14,
-            fontWeight: 500,
-            boxShadow: "0 8px 24px rgba(0,0,0,0.5)",
-            zIndex: 10000,
-            cursor: "pointer",
-            animation: "welcome-pop 0.4s cubic-bezier(.34,1.56,.64,1)",
-          }}
-        >
-          <img src="/img/logo.svg" alt="" style={{ width: 22, height: 22, marginRight: 8, verticalAlign: -4 }} />
-          Welcome to ICPixel · click anywhere to place a pixel
+      {missionBanner && (
+        <div style={{
+          position: "fixed", top: 20, left: "50%", transform: "translateX(-50%)",
+          zIndex: 9999, background: "rgba(22, 22, 26, 0.92)", border: "1px solid #f0c040",
+          borderRadius: 12, padding: "12px 24px", color: "#e8e8ec",
+          fontSize: 14, fontWeight: 600, textAlign: "center",
+          boxShadow: "0 8px 32px rgba(240, 192, 64, 0.3)",
+          animation: "fadeInDown 0.4s ease-out",
+        }}>
+          <span style={{ color: "#f0c040" }}>{missionBanner}</span> completed their mission!
         </div>
       )}
       {confetti && (
@@ -2193,7 +2197,7 @@ export default function App() {
           <img src="/img/logo.svg" alt="" style={{ width: 18, height: 18, marginRight: 6, verticalAlign: -3 }} />
           ICPixel
         </span>
-        {(["game", "dashboard", "admin"] as const).map((s) => (
+        {(["game", "dashboard", ...(isController ? ["admin" as const] : [])] as const).map((s) => (
           <button
             key={s}
             className={`nav-tab ${screen === s ? "active" : ""}`}
@@ -3527,65 +3531,176 @@ export default function App() {
 
             {/* Docs / GitHub */}
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginTop: 8 }}>
-              {["Docs", "GitHub"].map((label) => (
-                <button
-                  key={label}
-                  onClick={() => { /* TODO */ }}
-                  style={{
-                    padding: "12px 10px",
-                    background: "#1f1f25",
-                    border: "1px solid #2a2a32",
-                    borderRadius: 8,
-                    color: "#e8e8ec",
-                    fontSize: 13,
-                    cursor: "pointer",
-                  }}
-                >
-                  {label}
-                </button>
-              ))}
+              <a
+                href="https://github.com/TALfusion/ICPixel"
+                target="_blank"
+                rel="noopener noreferrer"
+                onClickCapture={(e) => { e.stopPropagation(); window.open("https://github.com/TALfusion/ICPixel", "_blank"); }}
+                style={{
+                  padding: "12px 10px",
+                  background: "#1f1f25",
+                  border: "1px solid #2a2a32",
+                  borderRadius: 8,
+                  color: "#e8e8ec",
+                  fontSize: 13,
+                  cursor: "pointer",
+                  textAlign: "center",
+                  textDecoration: "none",
+                  display: "block",
+                  zIndex: 10000,
+                  position: "relative",
+                  pointerEvents: "auto",
+                }}
+              >
+                GitHub
+              </a>
+              <a
+                href="https://icpixel.gitbook.io/icpixel-docs/"
+                target="_blank"
+                rel="noopener noreferrer"
+                onClickCapture={(e) => { e.stopPropagation(); window.open("https://icpixel.gitbook.io/icpixel-docs/", "_blank"); }}
+                style={{
+                  padding: "12px 10px",
+                  background: "#1f1f25",
+                  border: "1px solid #2a2a32",
+                  borderRadius: 8,
+                  color: "#e8e8ec",
+                  fontSize: 13,
+                  cursor: "pointer",
+                  textAlign: "center",
+                  textDecoration: "none",
+                  display: "block",
+                  zIndex: 10000,
+                  position: "relative",
+                  pointerEvents: "auto",
+                }}
+              >
+                Gitbook
+              </a>
             </div>
 
-            {/* Privacy / Terms */}
+            {/* Privacy / Terms buttons on one line */}
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginTop: 8 }}>
-              {["Privacy Policy", "Terms of Service"].map((label) => (
-                <button
-                  key={label}
-                  onClick={() => { /* TODO */ }}
-                  style={{
-                    padding: "12px 10px",
-                    background: "#1f1f25",
-                    border: "1px solid #2a2a32",
-                    borderRadius: 8,
-                    color: "#e8e8ec",
-                    fontSize: 13,
-                    cursor: "pointer",
-                  }}
-                >
-                  {label}
-                </button>
-              ))}
+              <button
+                onClick={() => { setShowPrivacy((v) => !v); setShowTerms(false); }}
+                style={{
+                  padding: "12px 10px",
+                  background: showPrivacy ? "#2a2a32" : "#1f1f25",
+                  border: `1px solid ${showPrivacy ? "#51e9f4" : "#2a2a32"}`,
+                  borderRadius: 8,
+                  color: "#e8e8ec",
+                  fontSize: 13,
+                  fontWeight: 600,
+                  cursor: "pointer",
+                }}
+              >
+                {showPrivacy ? "▾ Privacy Policy" : "▸ Privacy Policy"}
+              </button>
+              <button
+                onClick={() => { setShowTerms((v) => !v); setShowPrivacy(false); }}
+                style={{
+                  padding: "12px 10px",
+                  background: showTerms ? "#2a2a32" : "#1f1f25",
+                  border: `1px solid ${showTerms ? "#51e9f4" : "#2a2a32"}`,
+                  borderRadius: 8,
+                  color: "#e8e8ec",
+                  fontSize: 13,
+                  fontWeight: 600,
+                  cursor: "pointer",
+                }}
+              >
+                {showTerms ? "▾ Terms of Service" : "▸ Terms of Service"}
+              </button>
             </div>
+            {showPrivacy && (
+              <div style={{
+                padding: "14px 16px",
+                background: "#12121a",
+                border: "1px solid #2a2a32",
+                borderRadius: 8,
+                fontSize: 11,
+                color: "#b0b0c0",
+                lineHeight: 1.7,
+                maxHeight: 300,
+                overflowY: "auto",
+              }}>
+                <p style={{ margin: "0 0 8px", fontWeight: 700, color: "#e8e8ec", fontSize: 12 }}>Privacy Policy — Last updated: April 14, 2026</p>
+                <p style={{ margin: "0 0 8px" }}>ICPixel is a fully decentralized application running on the Internet Computer Protocol (ICP) blockchain. There are no centralized servers, databases, or cloud infrastructure operated by us.</p>
+                <p style={{ margin: "0 0 8px", fontWeight: 700, color: "#e8e8ec" }}>We do NOT collect:</p>
+                <p style={{ margin: "0 0 8px" }}>Names, emails, phone numbers, IP addresses, browser fingerprints, cookies, tracking pixels, analytics data, location data, or any personally identifiable information (PII).</p>
+                <p style={{ margin: "0 0 8px", fontWeight: 700, color: "#e8e8ec" }}>Blockchain data:</p>
+                <p style={{ margin: "0 0 8px" }}>Your Internet Identity principal, pixel placements, alliance membership, transactions, and NFT ownership are recorded on the ICP blockchain. This data is public by design, pseudonymous, permanent, and not controlled by us. We cannot delete, modify, or restrict access to on-chain data.</p>
+                <p style={{ margin: "0 0 8px", fontWeight: 700, color: "#e8e8ec" }}>Third parties:</p>
+                <p style={{ margin: "0 0 8px" }}>We do not share data with third parties. There is nothing to share. Authentication is handled by Internet Identity (DFINITY). Payments go through the ICP Ledger. We have no control over these services.</p>
+                <p style={{ margin: "0 0 8px", fontWeight: 700, color: "#e8e8ec" }}>Limitation of liability:</p>
+                <p style={{ margin: "0 0 8px" }}>The Service is provided "AS IS" without warranty. Our total aggregate liability shall not exceed $0.00 USD. You assume all risks associated with using the Service, including loss of funds, smart contract failure, and complete loss of digital assets.</p>
+                <p style={{ margin: "0 0 4px" }}>Contact: <b>ICPixel@proton.me</b></p>
+              </div>
+            )}
+            {showTerms && (
+              <div style={{
+                padding: "14px 16px",
+                background: "#12121a",
+                border: "1px solid #2a2a32",
+                borderRadius: 8,
+                fontSize: 11,
+                color: "#b0b0c0",
+                lineHeight: 1.7,
+                maxHeight: 300,
+                overflowY: "auto",
+              }}>
+                <p style={{ margin: "0 0 8px", fontWeight: 700, color: "#e8e8ec", fontSize: 12 }}>Terms of Service — Last updated: April 14, 2026</p>
+                <p style={{ margin: "0 0 8px" }}>By using ICPixel you agree to these terms. ICPixel is experimental, decentralized software for entertainment purposes only.</p>
+                <p style={{ margin: "0 0 8px", fontWeight: 700, color: "#e8e8ec" }}>No refunds:</p>
+                <p style={{ margin: "0 0 8px" }}>All transactions are final and non-refundable. This includes pixel purchases, alliance fees, and any ICP spent. We cannot reverse blockchain transactions.</p>
+                <p style={{ margin: "0 0 8px", fontWeight: 700, color: "#e8e8ec" }}>No guarantees:</p>
+                <p style={{ margin: "0 0 8px" }}>The Service is provided "AS IS". We do not guarantee uptime, correctness, security, or value of any digital assets. NFTs are speculative collectibles with no guaranteed value. Rewards are not dividends or guaranteed income.</p>
+                <p style={{ margin: "0 0 8px", fontWeight: 700, color: "#e8e8ec" }}>Smart contract risk:</p>
+                <p style={{ margin: "0 0 8px" }}>Smart contracts may contain bugs or vulnerabilities. Loss of funds due to exploits, bugs, or network issues is your sole responsibility. We are under no obligation to fix, compensate, or refund.</p>
+                <p style={{ margin: "0 0 8px", fontWeight: 700, color: "#e8e8ec" }}>Changes:</p>
+                <p style={{ margin: "0 0 8px" }}>Game mechanics, rules, pricing, and rewards may change at any time without notice. We may pause, modify, or shut down the Service at our discretion.</p>
+                <p style={{ margin: "0 0 8px", fontWeight: 700, color: "#e8e8ec" }}>Liability:</p>
+                <p style={{ margin: "0 0 8px" }}>Our total aggregate liability is $0.00 USD. You waive the right to class action lawsuits. Any disputes are resolved through binding arbitration. You agree to indemnify and hold us harmless from any claims.</p>
+                <p style={{ margin: "0 0 4px" }}>Contact: <b>ICPixel@proton.me</b></p>
+              </div>
+            )}
 
             {/* Social / Contact */}
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginTop: 8 }}>
-              {["Our X", "Contact us"].map((label) => (
-                <button
-                  key={label}
-                  onClick={() => { /* TODO */ }}
-                  style={{
-                    padding: "12px 10px",
-                    background: "#1f1f25",
-                    border: "1px solid #2a2a32",
-                    borderRadius: 8,
-                    color: "#e8e8ec",
-                    fontSize: 13,
-                    cursor: "pointer",
-                  }}
-                >
-                  {label}
-                </button>
-              ))}
+              <a
+                href="https://x.com/IcPixel80970"
+                target="_blank"
+                rel="noopener noreferrer"
+                style={{
+                  padding: "12px 10px",
+                  background: "#1f1f25",
+                  border: "1px solid #2a2a32",
+                  borderRadius: 8,
+                  color: "#e8e8ec",
+                  fontSize: 13,
+                  cursor: "pointer",
+                  textAlign: "center",
+                  textDecoration: "none",
+                }}
+              >
+                Our X
+              </a>
+              <a
+                href="mailto:ICPixel@proton.me"
+                style={{
+                  padding: "12px 10px",
+                  background: "#1f1f25",
+                  border: "1px solid #2a2a32",
+                  borderRadius: 8,
+                  color: "#e8e8ec",
+                  fontSize: 13,
+                  cursor: "pointer",
+                  textAlign: "center",
+                  textDecoration: "none",
+                }}
+              >
+                Contact us
+              </a>
             </div>
 
             {/* Bug reports / ideas */}
@@ -3601,7 +3716,7 @@ export default function App() {
               textAlign: "center",
             }}>
               Found a bug or have an idea?<br />
-              Send it to <span style={{ color: "#f0c040", fontWeight: 600 }}>feedback@icpixel.com</span><br />
+              Send it to <span style={{ color: "#f0c040", fontWeight: 600 }}>ICPixel@proton.me</span><br />
               <span style={{ color: "#60606a", fontSize: 11 }}>get free pixels for good suggestions</span>
             </div>
 

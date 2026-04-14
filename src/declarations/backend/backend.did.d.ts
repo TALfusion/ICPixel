@@ -55,6 +55,7 @@ export type AllianceError = { 'NameEmpty' : null } |
   { 'NotLeader' : null } |
   { 'NftMintFailed' : string } |
   { 'UpgradeMustContainOld' : null } |
+  { 'InvalidWebsite' : string } |
   { 'InternalError' : string } |
   { 'AlreadyInAlliance' : null };
 export type AllianceOrPublic = { 'Full' : Alliance } |
@@ -65,6 +66,7 @@ export interface AlliancePublic {
   'name' : string,
   'description' : string,
   'created_at' : bigint,
+  'website' : [] | [string],
   'pixels_captured' : bigint,
   'leader' : Principal,
   'member_count' : number,
@@ -113,14 +115,18 @@ export type DistributeTreasuryResult = { 'Ok' : DistributeReport } |
 export interface GameState {
   'final_stage_reached_at' : [] | [bigint],
   'treasury_operational_buffer_e8s' : [] | [bigint],
+  'test_radical_field' : [] | [string],
   'total_pixels_placed' : bigint,
   'season' : number,
   'treasury_last_distributed_season' : [] | [number],
+  'last_completed_mission_name' : [] | [string],
+  'test_big_number' : [] | [bigint],
   'unique_pixels_set' : bigint,
   'reward_pool_balance_e8s' : [] | [bigint],
   'treasury_balance_e8s' : [] | [bigint],
   'map_size' : number,
   'paused' : boolean,
+  'last_completed_mission_at' : [] | [bigint],
 }
 /**
  * HTTP gateway (certified-HTTP) request/response. Different shape than the
@@ -254,7 +260,7 @@ export interface _SERVICE {
   >,
   'claim_treasury' : ActorMethod<[], ClaimTreasuryResult>,
   'create_alliance' : ActorMethod<
-    [string, string, Mission],
+    [string, string, Mission, string],
     CreateAllianceResult
   >,
   'debug_fill' : ActorMethod<[number], bigint>,
