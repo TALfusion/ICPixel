@@ -13,8 +13,8 @@
 set -euo pipefail
 
 NETWORK="ic"
-BACKEND="YOUR_BACKEND_CANISTER_ID"
-FRONTEND="YOUR_FRONTEND_CANISTER_ID"
+BACKEND="s743i-5qaaa-aaaai-axh3a-cai"
+FRONTEND="jeebz-3aaaa-aaaai-axjfa-cai"
 DFX="DFX_WARNING=-mainnet_plaintext_identity dfx"
 
 RED='\033[0;31m'

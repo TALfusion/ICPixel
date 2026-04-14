@@ -531,41 +531,6 @@ fn get_admin_stats() -> AdminStats {
     }
 }
 
-// ───── Streak leaderboard ─────
-
-#[derive(candid::CandidType, serde::Serialize)]
-struct StreakEntry {
-    user: candid::Principal,
-    current_streak: u32,
-    max_streak: u32,
-    total_pixels: u64,
-}
-
-#[query]
-fn get_top_streaks(limit: u64) -> Vec<StreakEntry> {
-    let limit = limit.min(50) as usize;
-    let mut all: Vec<_> = state::USER_STATS.with(|m| {
-        m.borrow()
-            .iter()
-            .map(|(p, s)| StreakEntry {
-                user: p,
-                current_streak: s.current_streak,
-                max_streak: s.max_streak,
-                total_pixels: s.total_pixels,
-            })
-            .collect()
-    });
-    all.sort_by(|a, b| b.current_streak.cmp(&a.current_streak).then(b.total_pixels.cmp(&a.total_pixels)));
-    all.truncate(limit);
-    all
-}
-
-#[query]
-fn my_stats() -> types::UserStats {
-    let caller = ic_cdk::caller();
-    state::USER_STATS.with(|m| m.borrow().get(&caller).unwrap_or_default())
-}
-
 // ───── ICP/USD rate (XRC) ─────
 
 #[update]

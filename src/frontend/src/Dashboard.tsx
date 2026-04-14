@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback, useRef } from "react";
-import type { BackendActor, GameState, AlliancePublic, LeaderboardPage, StreakEntry } from "./idl";
+import type { BackendActor, GameState, AlliancePublic, LeaderboardPage } from "./idl";
 
 // ── Constants ────────────────────────────────────────────────────────
 // Mirrors STAGES in src/backend/src/map.rs.
@@ -59,25 +59,21 @@ export default function Dashboard({ actor, initialState, alliances, onPlay }: Da
   const [treasury, setTreasury] = useState<bigint>(0n);
   const [icpRate, setIcpRate] = useState<bigint>(0n); // micro-USD per ICP
   const [lb, setLb] = useState<LeaderboardPage | null>(null);
-  const [streaks, setStreaks] = useState<StreakEntry[]>([]);
-  const [dashTab, setDashTab] = useState<"alliances" | "streaks">("alliances");
   const [lastRefresh, setLastRefresh] = useState(0);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const refresh = useCallback(async () => {
     try {
-      const [g, t, price, board, topStreaks] = await Promise.all([
+      const [g, t, price, board] = await Promise.all([
         actor.get_game_state(),
         actor.get_treasury_balance(),
         actor.get_icp_price(),
         actor.leaderboard(0n, 20n),
-        actor.get_top_streaks(10n),
       ]);
       setGs(g);
       setTreasury(t);
       setIcpRate(price.usd_per_icp_micro);
       setLb(board);
-      setStreaks(topStreaks);
       setLastRefresh(Date.now());
     } catch (e) {
       console.warn("dashboard refresh failed", e);
@@ -286,33 +282,21 @@ export default function Dashboard({ actor, initialState, alliances, onPlay }: Da
       {/* ── Alliances / Streaks tabbed section ──────────────────── */}
       <div className="dash-section">
         <div style={{ display: "flex", gap: 0, borderBottom: "1px solid #2a2a32", marginBottom: 12 }}>
-          {(["alliances", "streaks"] as const).map((t) => (
-            <button
-              key={t}
-              onClick={() => setDashTab(t)}
-              style={{
-                flex: 1,
-                padding: "8px 0",
-                background: "none",
-                border: "none",
-                borderBottom: dashTab === t ? "2px solid #51e9f4" : "2px solid transparent",
-                color: dashTab === t ? "#e8e8ec" : "#60606a",
-                fontWeight: dashTab === t ? 700 : 400,
-                fontSize: 13,
-                cursor: "pointer",
-                textTransform: "uppercase",
-                letterSpacing: 1,
-                transition: "color 0.15s, border-color 0.15s",
-              }}
-            >
-              {t === "alliances" ? `Alliances (${lb ? Number(lb.total) : 0})` : `Streaks (${streaks.length})`}
-            </button>
-          ))}
+          <span style={{
+            flex: 1,
+            padding: "8px 0",
+            borderBottom: "2px solid #51e9f4",
+            color: "#e8e8ec",
+            fontWeight: 700,
+            fontSize: 13,
+            textTransform: "uppercase",
+            letterSpacing: 1,
+          }}>
+            Alliances ({lb ? Number(lb.total) : 0})
+          </span>
         </div>
 
-        {dashTab === "alliances" && (
-          <>
-            {lb && lb.entries.length > 0 ? (
+        {lb && lb.entries.length > 0 ? (
               <div className="dash-alliance-grid">
                 {lb.entries.map((e) => {
                   const rank = Number(e.rank);
@@ -401,68 +385,6 @@ export default function Dashboard({ actor, initialState, alliances, onPlay }: Da
                 </button>
               </div>
             )}
-          </>
-        )}
-
-        {dashTab === "streaks" && (
-          <>
-            {streaks.length > 0 ? (
-              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                <span className="dash-card-dim" style={{ fontSize: 11, marginBottom: 4 }}>
-                  consecutive days placing pixels
-                </span>
-                {streaks.map((s, i) => {
-                  const pid = s.user.toString();
-                  const short = `${pid.slice(0, 8)}…${pid.slice(-5)}`;
-                  const medal = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `#${i + 1}`;
-                  return (
-                    <div
-                      key={pid}
-                      style={{
-                        display: "flex",
-                        alignItems: "center",
-                        gap: 10,
-                        padding: "6px 10px",
-                        background: i < 3 ? "rgba(255,255,255,0.04)" : "transparent",
-                        borderRadius: 6,
-                        fontSize: 13,
-                      }}
-                    >
-                      <span style={{ minWidth: 28, textAlign: "center", fontSize: i < 3 ? 16 : 12 }}>
-                        {medal}
-                      </span>
-                      <span
-                        style={{
-                          flex: 1,
-                          fontFamily: "ui-monospace, SFMono-Regular, monospace",
-                          fontSize: 11,
-                          color: "#b0b0c0",
-                        }}
-                        title={pid}
-                      >
-                        {short}
-                      </span>
-                      <span style={{ fontWeight: 700, color: "#ffcc00", minWidth: 50, textAlign: "right" }}>
-                        {s.current_streak}d
-                      </span>
-                      <span className="dash-card-dim" style={{ fontSize: 10, minWidth: 60, textAlign: "right" }}>
-                        best: {s.max_streak}d
-                      </span>
-                      <span className="dash-card-dim" style={{ fontSize: 10, minWidth: 60, textAlign: "right" }}>
-                        {Number(s.total_pixels).toLocaleString()} px
-                      </span>
-                    </div>
-                  );
-                })}
-              </div>
-            ) : (
-              <div className="dash-empty">
-                <div style={{ fontSize: 36, opacity: 0.3, marginBottom: 8 }}>🔥</div>
-                <div>No streaks yet. Place pixels daily to build yours!</div>
-              </div>
-            )}
-          </>
-        )}
       </div>
     </div>
   );

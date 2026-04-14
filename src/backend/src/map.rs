@@ -7,7 +7,6 @@
 use crate::billing;
 use crate::state::{
     game_state, update_game_state, CHANGES, NEXT_VERSION, PIXEL_CREDITS,
-    USER_STATS,
 };
 use crate::types::{
     in_bounds, ChangesResponse, MapSnapshot, PixelChange, PlaceError, VersionInfo,
@@ -44,12 +43,6 @@ thread_local! {
     /// Batched GameState delta. Flushed to stable every FLUSH_INTERVAL pixels
     /// or on pre_upgrade. Saves ~2M cycles on 99% of pixels.
     static GS_DELTA: RefCell<(u64, u64)> = RefCell::new((0, 0)); // (total_delta, unique_delta)
-
-    /// In-memory daily pixel counter per principal. Tracks (last_day, count).
-    /// Only when the day changes do we write to stable USER_STATS.
-    /// Lost on upgrade = first pixel of next session writes to stable (safe).
-    static DAILY_PIXELS_CACHE: RefCell<HashMap<Principal, (u32, u64)>> =
-        RefCell::new(HashMap::new());
 
     /// In-memory cooldown cache. Replaces the old `LAST_PLACED` stable map
     /// for the per-player cooldown check. Lost on upgrade = all cooldowns
@@ -217,42 +210,6 @@ pub fn place_pixel(
     COOLDOWN_CACHE.with(|m| {
         m.borrow_mut().insert(principal, now_ns);
     });
-
-    // Update streak stats. Only writes to stable memory when the day
-    // changes (first pixel of a new day). Same-day pixels only bump an
-    // in-memory counter — saves ~2M cycles/pixel for repeat placements.
-    let today = (now_ns / 86_400_000_000_000) as u32; // days since epoch
-    let day_changed = DAILY_PIXELS_CACHE.with(|c| {
-        let mut cache = c.borrow_mut();
-        let entry = cache.entry(principal).or_insert((0u32, 0u64)); // (last_day, count)
-        if entry.0 == today {
-            entry.1 += 1;
-            false
-        } else {
-            entry.0 = today;
-            entry.1 = 1;
-            true
-        }
-    });
-    if day_changed {
-        USER_STATS.with(|m| {
-            let mut map = m.borrow_mut();
-            let mut stats = map.get(&principal).unwrap_or_default();
-            stats.total_pixels += 1;
-            if stats.last_day == 0 {
-                stats.current_streak = 1;
-            } else if today == stats.last_day + 1 {
-                stats.current_streak += 1;
-            } else if today > stats.last_day + 1 {
-                stats.current_streak = 1;
-            }
-            stats.last_day = today;
-            if stats.current_streak > stats.max_streak {
-                stats.max_streak = stats.current_streak;
-            }
-            map.insert(principal, stats);
-        });
-    }
 
     // Flat array: read old color to check was_new, then write new color.
     // ~20k cycles total vs ~3M for BTreeMap read+insert+candid encode.

@@ -68,20 +68,6 @@ type AdminStats = record {
   total_nfts_minted : nat64;
 };
 
-type UserStats = record {
-  current_streak : nat32;
-  max_streak : nat32;
-  last_day : nat32;
-  total_pixels : nat64;
-};
-
-type StreakEntry = record {
-  user : principal;
-  current_streak : nat32;
-  max_streak : nat32;
-  total_pixels : nat64;
-};
-
 type IcpUsdCache = record {
   usd_per_icp_micro : nat64;
   last_fetched_ns : nat64;
@@ -325,9 +311,6 @@ service : {
 
   am_i_controller : () -> (bool) query;
   get_admin_stats : () -> (AdminStats) query;
-
-  get_top_streaks : (nat64) -> (vec StreakEntry) query;
-  my_stats : () -> (UserStats) query;
 
   refresh_icp_price : () -> (RefreshIcpPriceResult);
   get_icp_price : () -> (IcpUsdCache) query;

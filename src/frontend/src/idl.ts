@@ -39,7 +39,5 @@ export type {
   PlaceError,
   PlaceResult,
   SetBillingResult,
-  StreakEntry,
-  UserStats,
   VersionInfo,
 } from "../../declarations/backend/backend.did";
