@@ -65,10 +65,26 @@ fn weight_for(pixel_count: u64, rank: u32, total: u32) -> u128 {
     if total == 0 {
         return 0;
     }
-    let size = (pixel_count as f64).sqrt();
-    let age = 1.0 + (1.0 - (rank as f64) / (total as f64));
-    let scaled = (size * age * 1_000_000.0).max(0.0);
-    scaled as u128
+    // Integer sqrt scaled by 1e6 for precision.
+    // isqrt(pixel_count * 1e12) = sqrt(pixel_count) * 1e6
+    let size = isqrt((pixel_count as u128) * 1_000_000_000_000);
+    // age_mult = 1 + (1 - rank/total), scaled by 1e6.
+    // = (2*total - rank) / total, scaled by 1e6
+    let age = (2 * total as u128 - rank as u128) * 1_000_000 / total as u128;
+    // weight = size * age / 1e6 (remove one scale factor)
+    size * age / 1_000_000
+}
+
+/// Integer square root via Newton's method.
+fn isqrt(n: u128) -> u128 {
+    if n == 0 { return 0; }
+    let mut x = n;
+    let mut y = (x + 1) / 2;
+    while y < x {
+        x = y;
+        y = (x + n / x) / 2;
+    }
+    x
 }
 
 /// Admin-only. Distribute the canister's spare ICP balance between the

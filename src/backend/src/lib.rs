@@ -199,12 +199,6 @@ fn get_alliance_billing() -> billing::Billing {
     billing::get()
 }
 
-/// Current alliance creation price in USD cents (tiered: 1st free, 2nd $3, etc.)
-#[query]
-fn get_alliance_price_usd_cents() -> u16 {
-    let count = state::NEXT_ALLIANCE_ID.with(|c| *c.borrow().get()) - 1;
-    billing::alliance_price_usd_cents(count)
-}
 
 #[update]
 fn set_alliance_price(e8s: u64) -> Result<(), String> {
@@ -480,12 +474,9 @@ struct AdminStats {
     unique_pixels_set: u64,
     paused: bool,
     // Economy
-    pixel_price_usd_cents: u16,
     pixel_cooldown_seconds: u32,
     treasury_balance_e8s: u64,
     wallet_pending_e8s: u64,
-    icp_usd_micro: u64,
-    icp_usd_last_fetched_ns: u64,
     // Counts
     total_alliances: u64,
     total_users: u64,
@@ -496,7 +487,6 @@ struct AdminStats {
 fn get_admin_stats() -> AdminStats {
     let gs = state::game_state();
     let billing = billing::get();
-    let price = icp_price::raw();
     let health = get_health();
 
     let total_alliances = state::ALLIANCES.with(|a| a.borrow().len());
@@ -519,45 +509,13 @@ fn get_admin_stats() -> AdminStats {
         total_pixels_placed: gs.total_pixels_placed,
         unique_pixels_set: gs.unique_pixels_set,
         paused: gs.paused,
-        pixel_price_usd_cents: billing.pixel_price_usd_cents,
         pixel_cooldown_seconds: billing.pixel_cooldown_seconds,
         treasury_balance_e8s: gs.treasury_balance_e8s.unwrap_or(0),
         wallet_pending_e8s: state::wallet_pending_e8s(),
-        icp_usd_micro: price.usd_per_icp_micro,
-        icp_usd_last_fetched_ns: price.last_fetched_ns,
         total_alliances,
         total_users,
         total_nfts_minted,
     }
-}
-
-// ───── ICP/USD rate (XRC) ─────
-
-#[update]
-async fn refresh_icp_price() -> Result<icp_price::IcpUsdCache, String> {
-    if !ic_cdk::api::is_controller(&ic_cdk::caller()) {
-        return Err("only controllers can refresh the ICP price".into());
-    }
-    icp_price::refresh().await
-}
-
-/// Emergency override for ICP/USD rate when XRC is down.
-/// Accepts micro-USD (e.g. 12_500_000 = $12.50 per ICP).
-#[update]
-fn admin_set_icp_price_override(usd_per_icp_micro: u64) -> Result<(), String> {
-    if !ic_cdk::api::is_controller(&ic_cdk::caller()) {
-        return Err("only controllers".into());
-    }
-    if usd_per_icp_micro == 0 {
-        return Err("rate must be > 0".into());
-    }
-    icp_price::admin_set_override(usd_per_icp_micro);
-    Ok(())
-}
-
-#[query]
-fn get_icp_price() -> icp_price::IcpUsdCache {
-    icp_price::raw()
 }
 
 /// HTTP gateway entry point. Serves the `/og.png` Open Graph preview image
@@ -649,31 +607,11 @@ fn post_upgrade() {
 /// expensive XRC refresh.
 fn arm_icp_price_timer() {
     use std::time::Duration;
-    // Immediate one-shot: refresh ICP price + ledger fee on startup so the
-    // cache isn't stale right after an upgrade.
-    ic_cdk_timers::set_timer(Duration::ZERO, || {
-        ic_cdk::spawn(async {
-            let _ = icp_price::refresh().await;
-            let cfg = billing::get();
-            if let Some(ledger) = cfg.ledger {
-                let _ = icp_ledger::refresh_ledger_fee(ledger).await;
-            }
-        });
-    });
-    // XRC refresh — every 6 hours.
-    ic_cdk_timers::set_timer_interval(Duration::from_secs(12 * 60 * 60), || {
-        ic_cdk::spawn(async {
-            if let Err(e) = icp_price::refresh().await {
-                ic_cdk::println!("scheduled icp_price::refresh failed: {e}");
-            }
-            // Piggyback: refresh ICP ledger fee cache so transfers don't
-            // fail if governance changes the fee between restarts.
-            let cfg = billing::get();
-            if let Some(ledger) = cfg.ledger {
-                let _ = icp_ledger::refresh_ledger_fee(ledger).await;
-            }
-        });
-    });
+    // XRC and ledger-fee refresh DISABLED — pixel pack prices are now
+    // hardcoded in ICP (not USD-pegged), so no exchange rate is needed.
+    // Saves ~$1.60/month in cycles on mainnet. Re-enable if pricing
+    // switches back to USD-denominated.
+
     // Cycles health log — every 5 minutes. Cheap (no inter-canister calls).
     ic_cdk_timers::set_timer_interval(Duration::from_secs(300), || {
         check_cycles_and_log();

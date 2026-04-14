@@ -13,10 +13,8 @@ function fmtCycles(n: number | bigint): string {
   const t = Number(n) / 1e12;
   return t.toFixed(2) + " T";
 }
-function fmtIcp(e8s: number | bigint): string {
-  return (Number(e8s) / 1e8).toFixed(4) + " ICP";
-}
-function fmtUsd(micro: number | bigint): string {
+import { fmtIcp } from "./fmt";
+function fmtUsdRate(micro: number | bigint): string {
   if (Number(micro) === 0) return "—";
   return "$" + (Number(micro) / 1e6).toFixed(2);
 }
@@ -97,7 +95,7 @@ export default function AdminPanel({ actor, onClose }: Props) {
     try {
       const res = await actor.refresh_icp_price();
       if ("Err" in res) setMsg("Error: " + res.Err);
-      else setMsg("Rate: " + fmtUsd(res.Ok.usd_per_icp_micro));
+      else setMsg("Rate: " + fmtUsdRate(res.Ok.usd_per_icp_micro));
     } catch (e) { setMsg(String(e)); }
   }
 
@@ -126,7 +124,7 @@ export default function AdminPanel({ actor, onClose }: Props) {
         <MetricCard label="NFTs Minted" value={fmt(stats.total_nfts_minted)} />
         <MetricCard label="Treasury" value={fmtIcp(stats.treasury_balance_e8s)} />
         <MetricCard label="Wallet Pending" value={fmtIcp(stats.wallet_pending_e8s)} />
-        <MetricCard label="ICP/USD" value={fmtUsd(stats.icp_usd_micro)} sub={fmtAge(stats.icp_usd_last_fetched_ns)} />
+        <MetricCard label="ICP/USD" value={fmtUsdRate(stats.icp_usd_micro)} sub={fmtAge(stats.icp_usd_last_fetched_ns)} />
         <MetricCard label="Pixel Price" value={stats.pixel_price_usd_cents === 0 ? "FREE" : `${stats.pixel_price_usd_cents}¢`} />
         <MetricCard label="Cooldown" value={`${stats.pixel_cooldown_seconds}s`} />
         <MetricCard label="Status" value={stats.paused ? "PAUSED" : "LIVE"} warn={stats.paused} />

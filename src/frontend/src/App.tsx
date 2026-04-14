@@ -384,6 +384,8 @@ export default function App() {
   // the backend — no client changes needed.
   const [pixelCredits, setPixelCredits] = useState<bigint>(0n);
   const [shopOpen, setShopOpen] = useState(false);
+  // Cached ICP/USD rate for shop display. Fetched from backend on mount.
+  const [usdPerIcp, setUsdPerIcp] = useState(0);
   const [helpOpen, setHelpOpen] = useState(false);
   const [howToPlay, setHowToPlay] = useState(false);
   const [showPrivacy, setShowPrivacy] = useState(false);
@@ -395,7 +397,6 @@ export default function App() {
   // backend credits the pack (currently free-mode, but the flow is
   // already wired so flipping to real ICRC-2 later changes backend only).
   const [shopDepositPack, setShopDepositPack] = useState<number | null>(null);
-  const [shopCopied, setShopCopied] = useState(false);
   const refreshCredits = useCallback(async () => {
     if (!actor) return;
     try {
@@ -409,63 +410,6 @@ export default function App() {
     refreshCredits();
   }, [refreshCredits]);
 
-  // Live ICP/USD rate for showing the PIXEL balance's ICP equivalent.
-  // Fetched directly from CoinGecko in the user's browser — same pattern
-  // Fetched client-side. This bypasses the canister entirely:
-  //   - zero cycles cost (no HTTPS outcall through the IC)
-  //   - one less round-trip per page load
-  //   - CoinGecko rate-limits per IP so a million users won't get
-  //     throttled by a single shared canister outcall
-  //
-  // Refreshed every 60s. Cached locally in state; if the fetch fails
-  // (network error, CORS hiccup, rate limit) we keep the last good value
-  // and just hide the hint on first-ever load.
-  const PIXEL_USD_PRICE = 0.05;
-  const [usdPerIcp, setUsdPerIcp] = useState<number>(0);
-  useEffect(() => {
-    let stopped = false;
-    const pull = async () => {
-      try {
-        const res = await fetch(
-          "https://api.coingecko.com/api/v3/simple/price?ids=internet-computer&vs_currencies=usd"
-        );
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = (await res.json()) as {
-          "internet-computer"?: { usd?: number };
-        };
-        const price = data["internet-computer"]?.usd;
-        if (stopped) return;
-        if (typeof price === "number" && isFinite(price) && price > 0) {
-          setUsdPerIcp(price);
-        }
-      } catch (e) {
-        // Non-fatal — leave the last known rate in place (or 0 on first load).
-        console.warn("CoinGecko fetch failed", e);
-      }
-    };
-    pull();
-    const id = setInterval(pull, 60_000);
-    return () => {
-      stopped = true;
-      clearInterval(id);
-    };
-  }, []);
-
-  /// Format a PIXEL credit count as its ICP equivalent using the current
-  /// rate. Returns null if the rate is unknown (so the caller can hide
-  /// the hint instead of showing zeros).
-  const creditsToIcp = useCallback(
-    (credits: bigint): string | null => {
-      if (usdPerIcp <= 0) return null;
-      const usd = Number(credits) * PIXEL_USD_PRICE;
-      const icp = usd / usdPerIcp;
-      if (icp === 0) return "0 ICP";
-      if (icp < 0.0001) return "<0.0001 ICP";
-      // 4 decimals for readable amounts, strip trailing zeros.
-      return `${icp.toFixed(4).replace(/\.?0+$/, "")} ICP`;
-    },
-    [usdPerIcp]
-  );
   async function handleBuyPixels(count: number) {
     if (!actor || shopBusy) return;
     // View-only gate. After sign-in, replay the same purchase automatically.
@@ -537,7 +481,6 @@ export default function App() {
         await refreshCredits();
         setShopOpen(false);
         setShopDepositPack(null);
-        setShopCopied(false);
       }
     } catch (e) {
       setStatus("buy_pixels error: " + String(e));
@@ -651,6 +594,9 @@ export default function App() {
           setActor(a);
           await refreshAll(a);
           a.am_i_controller().then(setIsController).catch(() => {});
+          a.get_icp_price().then((p: { usd_per_icp_micro: bigint }) => {
+            if (p.usd_per_icp_micro > 0n) setUsdPerIcp(Number(p.usd_per_icp_micro) / 1_000_000);
+          }).catch(() => {});
           setStatus(isAuthed ? "ready" : "ready (read-only — sign in to play)");
         } else {
           // Local dev: auto-hydrate (or generate on first run) a persistent
@@ -2244,15 +2190,6 @@ export default function App() {
           >
             <span>{String(pixelCredits)}</span>
             <span style={{ opacity: 0.55, fontWeight: 500, fontSize: 11, letterSpacing: 0.5 }}>PIXEL</span>
-            {(() => {
-              const icp = creditsToIcp(pixelCredits);
-              if (!icp) return null;
-              return (
-                <span style={{ opacity: 0.45, fontWeight: 500, fontSize: 10, fontVariantNumeric: "tabular-nums", marginLeft: 2 }}>
-                  ({icp})
-                </span>
-              );
-            })()}
             <span style={{ marginLeft: 2, fontSize: 14, lineHeight: 1, opacity: 0.7 }}>+</span>
           </button>
         )}
@@ -2262,27 +2199,6 @@ export default function App() {
         {/* Game action buttons — right side */}
         {screen === "game" && !replayMode && (
           <>
-            <button
-              className="btn"
-              onClick={async () => {
-                if (!actor) return;
-                try {
-                  for (let i = 0; i < 200; i++) {
-                    const written = await actor.debug_fill(99);
-                    if (Number(written) === 0) break;
-                  }
-                  const gs = await actor.get_game_state();
-                  setState(gs);
-                  const m = await fetchFullMap(actor, gs.map_size);
-                  setMap(m);
-                } catch (e) {
-                  console.warn("debug_fill failed", e);
-                }
-              }}
-              data-tip="DEBUG: fill the map leaving exactly one cell empty"
-            >
-              fill all − 1
-            </button>
             <button
               className="btn"
               onClick={() => enterReplay()}
@@ -2669,8 +2585,7 @@ export default function App() {
               if (shopBusy) return;
               setShopOpen(false);
               setShopDepositPack(null);
-              setShopCopied(false);
-            }}
+                  }}
             style={{
               position: "absolute",
               inset: 0,
@@ -2711,16 +2626,18 @@ export default function App() {
                     Buy pixel credits. Each credit = 1 pixel. Currently free
                     — the deposit address below is for the live-mode preview.
                   </div>
-                  {[100, 500, 1000].map((n) => {
-                    const icp = creditsToIcp(BigInt(n));
-                    return (
+                  {([
+                    { count: 10, icp: "0.001" },
+                    { count: 100, icp: "2" },
+                    { count: 500, icp: "5" },
+                    { count: 1000, icp: "8" },
+                  ] as const).map(({ count: n, icp }) => (
                       <button
                         key={n}
                         disabled={shopBusy}
                         onClick={() => {
                           setShopDepositPack(n);
-                          setShopCopied(false);
-                        }}
+                                          }}
                         style={{
                           display: "flex",
                           alignItems: "center",
@@ -2740,20 +2657,17 @@ export default function App() {
                         }}
                       >
                         <span>+{n.toLocaleString()} pixels</span>
-                        {icp && (
-                          <span
-                            style={{
-                              fontSize: 11,
-                              color: "#9090a0",
-                              fontWeight: 500,
-                            }}
-                          >
-                            {icp}
-                          </span>
-                        )}
+                        <span
+                          style={{
+                            fontSize: 11,
+                            color: "#9090a0",
+                            fontWeight: 500,
+                          }}
+                        >
+                          {icp} ICP
+                        </span>
                       </button>
-                    );
-                  })}
+                  ))}
                   <button
                     onClick={() => setShopOpen(false)}
                     disabled={shopBusy}
@@ -2774,12 +2688,8 @@ export default function App() {
                   </button>
                 </>
               ) : (
-                // ── Deposit view ──────────────────────────────────
+                // ── Confirm + pay view (ICRC-2 approve flow) ──────
                 (() => {
-                  const depositAddress =
-                    (import.meta.env.VITE_BACKEND_CANISTER_ID as string) ?? "";
-                  const depositIcp =
-                    creditsToIcp(BigInt(shopDepositPack)) ?? "— ICP";
                   return (
                     <>
                       <div
@@ -2790,7 +2700,7 @@ export default function App() {
                           color: "#e8e8ec",
                         }}
                       >
-                        Pay for {shopDepositPack.toLocaleString()} PIXEL
+                        Buy {shopDepositPack.toLocaleString()} pixels
                       </div>
                       <div
                         style={{
@@ -2799,66 +2709,29 @@ export default function App() {
                           marginBottom: 16,
                         }}
                       >
-                        Send exactly{" "}
-                        <span style={{ color: "#f0c040", fontWeight: 700 }}>
-                          {depositIcp}
-                        </span>{" "}
-                        to the address below, then click "I paid". Currently
-                        in free mode — the address is shown for the real
-                        ICRC-2 flow that ships next.
-                      </div>
-
-                      {/* Address box + copy */}
-                      <div
-                        style={{
-                          display: "flex",
-                          alignItems: "center",
-                          gap: 8,
-                          padding: "10px 12px",
-                          marginBottom: 14,
-                          background: "#0f0f12",
-                          border: "1px solid #2a2a32",
-                          borderRadius: 6,
-                          fontSize: 11,
-                          fontFamily:
-                            "ui-monospace, SFMono-Regular, Menlo, monospace",
-                          color: "#e8e8ec",
-                          wordBreak: "break-all",
-                        }}
-                      >
-                        <span style={{ flex: 1 }}>{depositAddress}</span>
-                        <button
-                          onClick={() => {
-                            navigator.clipboard
-                              .writeText(depositAddress)
-                              .then(() => setShopCopied(true))
-                              .catch(() => {});
-                          }}
-                          disabled={shopBusy}
-                          style={{
-                            padding: "4px 10px",
-                            background: shopCopied ? "#2b8a3e" : "#1f1f25",
-                            color: "#e8e8ec",
-                            border: "1px solid #3a3a44",
-                            borderRadius: 4,
-                            fontSize: 11,
-                            fontWeight: 700,
-                            cursor: "pointer",
-                          }}
-                        >
-                          {shopCopied ? "copied" : "copy"}
-                        </button>
+                        {usdPerIcp > 0 ? (
+                          <>
+                            You will approve{" "}
+                            <span style={{ color: "#f0c040", fontWeight: 700 }}>
+                              ~{((shopDepositPack * 0.05) / usdPerIcp * 1.1).toFixed(4)} ICP
+                            </span>{" "}
+                            from your wallet. The exact amount is calculated from the
+                            live ICP/USD rate (${usdPerIcp.toFixed(2)}/ICP) + 10% buffer.
+                          </>
+                        ) : (
+                          "Loading ICP rate..."
+                        )}
                       </div>
 
                       <button
-                        disabled={shopBusy}
+                        disabled={shopBusy || usdPerIcp <= 0}
                         onClick={() => handleBuyPixels(shopDepositPack)}
                         style={{
                           display: "block",
                           width: "100%",
                           padding: "10px 14px",
                           marginBottom: 8,
-                          background: "#f0c040",
+                          background: shopBusy ? "#9090a0" : "#f0c040",
                           color: "#16161a",
                           border: "none",
                           borderRadius: 6,
@@ -2867,13 +2740,12 @@ export default function App() {
                           cursor: shopBusy ? "wait" : "pointer",
                         }}
                       >
-                        {shopBusy ? "verifying…" : "I paid"}
+                        {shopBusy ? status || "processing…" : "Approve & Buy"}
                       </button>
 
                       <button
                         onClick={() => {
                           setShopDepositPack(null);
-                          setShopCopied(false);
                         }}
                         disabled={shopBusy}
                         style={{

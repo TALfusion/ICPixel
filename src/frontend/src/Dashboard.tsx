@@ -8,19 +8,7 @@ const SEASON_TAIL_DAYS = 4;
 const REFRESH_MS = 30_000;
 
 // ── Helpers ──────────────────────────────────────────────────────────
-function fmtIcp(e8s: bigint): string {
-  const whole = e8s / 100_000_000n;
-  const frac = e8s % 100_000_000n;
-  return `${whole}.${frac.toString().padStart(8, "0").slice(0, 2)}`;
-}
-
-function fmtUsd(e8s: bigint, microRate: bigint): string {
-  if (microRate === 0n) return "—";
-  // usd = icp * rate/1e6;  icp = e8s/1e8
-  const cents = (e8s * microRate) / 1_000_000n / 1_000_000n; // in micro-usd → /1e6
-  const usd = Number(e8s) * (Number(microRate) / 1e6) / 1e8;
-  return `$${usd.toFixed(2)}`;
-}
+import { fmtIcp, fmtUsd } from "./fmt";
 
 function stageIndex(mapSize: number): number {
   const idx = STAGES.indexOf(mapSize);

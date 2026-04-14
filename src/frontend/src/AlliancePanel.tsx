@@ -313,15 +313,7 @@ function fmtError(err: AllianceError | string | null): string {
 
 /// Format an e8s amount as ICP with up to 4 decimal places. Used by the
 /// rewards UI to show estimated and actual claim shares.
-function fmtIcp(e8s: bigint): string {
-  if (e8s === 0n) return "0";
-  const whole = e8s / 100_000_000n;
-  const frac = e8s % 100_000_000n;
-  if (frac === 0n) return `${whole}`;
-  // Show 4 decimal places, trim trailing zeros.
-  const fracStr = frac.toString().padStart(8, "0").slice(0, 4).replace(/0+$/, "");
-  return fracStr.length > 0 ? `${whole}.${fracStr}` : `${whole}`;
-}
+import { fmtIcp } from "./fmt";
 
 /// Self-contained rewards section. Polls `get_mission_rounds` and
 /// `my_mission_contribution` for the current alliance and renders:
