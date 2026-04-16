@@ -16,3 +16,9 @@ serde_bytes = "0.11"
 # PNG encoder for the /og.png http_request endpoint. Pure-Rust, builds for
 # wasm32-unknown-unknown without issue. Matches the nft canister's dep.
 png = "0.17"
+# AccountIdentifier (old-style) computation for deposit order flow: SHA-224
+# over the principal+subaccount, CRC-32 checksum prefix. Both crates are
+# tiny (~500KB combined) and build cleanly on wasm32.
+sha2 = { version = "0.10", default-features = false }
+crc32fast = { version = "1", default-features = false }
+hex = { version = "0.4", default-features = false, features = ["alloc"] }

@@ -4,7 +4,7 @@
 // We re-export only the pieces the frontend needs:
 //  - idlFactory   — candid factory for Actor.createActor
 //  - BackendActor — typed service interface (aliased from _SERVICE)
-//  - individual types the frontend references directly
+//  - individual record / variant types the frontend references directly
 
 export { idlFactory } from "../../declarations/backend/backend.did.js";
 
@@ -15,29 +15,22 @@ export type {
   AllianceError,
   AllianceOrPublic,
   AlliancePublic,
-  AllianceUnitResult,
   Billing,
-  BuyPixelsResult,
   ChangesResponse,
-  CheckMissionResult,
-  ClaimMissionRewardResult,
   ClaimResult,
-  ClaimTreasuryResult,
-  CreateAllianceResult,
   DistributeReport,
-  DistributeTreasuryResult,
   GameState,
-  IcpUsdCache,
   LeaderboardEntry,
   LeaderboardPage,
   Mission,
-  MissionContributionResult,
   MissionContributionView,
   MissionRoundPublic,
   MissionStatus,
+  OrderCreated,
+  OrderStatus,
+  OrderView,
   PixelChange,
+  PixelPack,
   PlaceError,
-  PlaceResult,
-  SetBillingResult,
   VersionInfo,
 } from "../../declarations/backend/backend.did";

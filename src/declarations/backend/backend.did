@@ -1,341 +1,622 @@
-type GameState = record {
-  map_size : nat16;
-  season : nat32;
+type AdminStats = record {
+  total_users : nat64;
+  pixel_cooldown_seconds : nat32;
   total_pixels_placed : nat64;
-  unique_pixels_set : nat64;
-  final_stage_reached_at : opt nat64;
-  paused : bool;
-  treasury_balance_e8s : opt nat64;
-  treasury_last_distributed_season : opt nat32;
-  treasury_operational_buffer_e8s : opt nat64;
-  reward_pool_balance_e8s : opt nat64;
-  test_radical_field : opt text;
-  test_big_number : opt nat64;
-  last_completed_mission_name : opt text;
-  last_completed_mission_at : opt nat64;
-};
-
-type DistributeReport = record {
+  low_cycles_warning : bool;
   season : nat32;
-  total_distributable_e8s : nat64;
+  cycles : nat64;
+  unique_pixels_set : nat64;
+  wallet_pending_e8s : nat64;
+  stable_pages : nat64;
+  total_nfts_minted : nat64;
+  treasury_balance_e8s : nat64;
+  total_alliances : nat64;
+  map_size : nat16;
+  paused : bool;
+};
+type Alliance = record {
+  id : nat64;
+  members : vec principal;
+  nft_token_id : opt nat64;
+  mission : Mission;
+  name : text;
+  description : text;
+  created_at : nat64;
+  // Optional website URL for the alliance. Must start with "https://"
+  // and be ≤ 200 chars if set. Option for upgrade-safety per MIGRATION.md.
+  website : opt text;
+  pixels_captured : nat64;
+  prev_nft_token_id : opt nat64;
+  leader : principal;
+  nft_mint_in_progress : bool;
+};
+type AllianceError = variant {
+  NameEmpty;
+  Paused;
+  DescriptionTooLong;
+  RoundNotFound;
+  NoContribution;
+  PaymentFailed : text;
+  NftCanisterNotConfigured;
+  RoundNotCompleted;
+  MissionAreaAlreadyPainted : nat8;
+  NotFound;
+  AlreadyClaimed;
+  NftNotBurned;
+  MissionNotComplete;
+  OldPixelsModified;
+  Unauthorized;
+  NotInAlliance;
+  InvalidMission : text;
+  NameTooLong;
+  NotLeader;
+  NftMintFailed : text;
+  UpgradeMustContainOld;
+  InvalidWebsite : text;
+  InternalError : text;
+  AlreadyInAlliance;
+};
+type AllianceOrPublic = variant { Full : Alliance; Public : AlliancePublic };
+// Public view (no mission) — what non-members see in `list_alliances`.
+type AlliancePublic = record {
+  id : nat64;
+  nft_token_id : opt nat64;
+  name : text;
+  description : text;
+  created_at : nat64;
+  website : opt text;
+  pixels_captured : nat64;
+  leader : principal;
+  member_count : nat32;
+};
+// Mutable billing config. All fields can be changed at runtime by a
+// canister controller via the admin endpoints in `lib.rs`.
+type Billing = record {
+  // Mission reward pool share, 0..=100.
+  reward_pool_pct : opt nat8;
+  // Treasury share, 0..=100.
+  treasury_pct : nat8;
+  // Legacy field kept for backward-compat decode. Ignored at runtime.
+  pixel_price_e8s : opt nat64;
+  // Legacy field kept for backward-compat decode. Ignored at runtime.
+  pixel_price_usd_cents : nat16;
+  // Per-player cooldown between pixel placements, in seconds. `0` disables.
+  pixel_cooldown_seconds : nat32;
+  // Where the wallet share of the fee goes.
+  wallet_principal : principal;
+  // Wallet share, 0..=100. `wallet_pct + treasury_pct + reward_pool_pct` must equal 100.
+  wallet_pct : nat8;
+  // Cost of `create_alliance` in e8s (1 ICP = 100_000_000 e8s).
+  // `0` means alliances are free and no payment is attempted.
+  alliance_price_e8s : nat64;
+  // ICP ledger canister. Required for all paid operations (packs,
+  // alliances). Must be set via `set_alliance_billing` after deploy.
+  ledger : opt principal;
+  // Where the treasury share of the fee goes.
+  treasury_principal : principal;
+};
+// Cheap health probe. Returns the canister's current cycle balance and
+// the size of stable memory in pages (1 page = 64 KiB). Open query so
+// the frontend can render an admin pill, and an external monitor can
+// poll without controller credentials.
+// 
+// Stable storage is a hard cap (~96 GiB on the IC); cycles run out
+// silently and brick the canister. Both are worth watching at the
+// same time.
+type CanisterHealth = record {
+  low_cycles_warning : bool;
+  cycles : nat64;
+  stable_pages : nat64;
+};
+// Returned by `get_changes_since`. If `map_size` differs from what the
+// client knows about, the client MUST do a full reload.
+// 
+// `min_version` is the lowest version still available in the change log.
+// If the caller's `from_version < min_version`, the caller has fallen
+// outside the trim window and MUST do a full reload — they've missed
+// changes that have been pruned from the log.
+// 
+// `next_version` tells the client where to resume. When
+// `next_version < current_version`, more data is available and the
+// client should call again with `from_version = next_version`. When
+// they're equal, the client is fully caught up. This is how clients
+// walk the full season history in chunks without blowing the query
+// response-size limit — `get_changes_since` caps each reply at
+// `GET_CHANGES_HARD_CAP` entries.
+type ChangesResponse = record {
+  min_version : nat64;
+  next_version : nat64;
+  current_version : nat64;
+  changes : vec PixelChange;
+  map_size : nat16;
+};
+// Result of a successful `claim_mission_reward` call.
+type ClaimResult = record {
+  // Whether the e8s were actually transferred to the caller's wallet.
+  // Currently always `false` — Phase 1 implements bookkeeping only;
+  // real ICRC-1 transfers ship in Phase 2 alongside the rest of the
+  // payment plumbing.
+  transferred : bool;
+  share_e8s : nat64;
+};
+// Result returned by `distribute_treasury` so the admin can sanity-check
+// what just happened.
+type DistributeReport = record {
+  tokens_considered : nat32;
+  season : nat32;
   owner_paid_e8s : nat64;
   holders_pool_e8s : nat64;
   holders_credited : nat32;
-  tokens_considered : nat32;
+  total_distributable_e8s : nat64;
 };
-
-type DistributeTreasuryResult = variant { Ok : DistributeReport; Err : text };
-type ClaimTreasuryResult = variant { Ok : nat64; Err : text };
-
-type PlaceError = variant {
-  OutOfBounds;
-  InvalidColor;
-  SeasonEnded;
-  Unauthorized;
-  Cooldown : record { remaining_ns : nat64 };
-  NoCredits;
-  Paused;
-  InternalError : text;
+// Sizes of every paginated collection. Client uses this to decide how
+// many chunks to fetch per category.
+type ExportCounts = record {
+  mission_tile_index : nat64;
+  pixel_credits : nat64;
+  user_stats : nat64;
+  user_alliance : nat64;
+  pending_orders : nat64;
+  pixels : nat64;
+  last_placed : nat64;
+  // Size in bytes of the flat pixel-color memory region. Export with
+  // `admin_export_pixel_colors(offset, len)`.
+  pixel_colors_bytes : nat64;
+  alliances : nat64;
+  alliance_rounds : nat64;
+  changes : nat64;
+  claimable_treasury : nat64;
 };
-
-type Billing = record {
-  alliance_price_e8s : nat64;
-  pixel_price_usd_cents : nat16;
-  pixel_cooldown_seconds : nat32;
-  ledger : opt principal;
-  wallet_principal : principal;
-  treasury_principal : principal;
-  wallet_pct : nat8;
-  treasury_pct : nat8;
-  reward_pool_pct : opt nat8;
-};
-
-type AdminStats = record {
-  cycles : nat64;
-  stable_pages : nat64;
-  low_cycles_warning : bool;
-  season : nat32;
-  map_size : nat16;
-  total_pixels_placed : nat64;
-  unique_pixels_set : nat64;
-  paused : bool;
-  pixel_price_usd_cents : nat16;
-  pixel_cooldown_seconds : nat32;
-  treasury_balance_e8s : nat64;
+// One-shot bundle of every `StableCell` / counter. All singletons are
+// small, so returning them in a single query keeps the client simple.
+type ExportSingletons = record {
+  next_alliance_id : nat64;
+  icp_usd_cache : IcpUsdCache;
+  billing : Billing;
+  next_version : nat64;
+  game_state : GameState;
+  nft_canister : opt principal;
   wallet_pending_e8s : nat64;
-  icp_usd_micro : nat64;
-  icp_usd_last_fetched_ns : nat64;
-  total_alliances : nat64;
-  total_users : nat64;
-  total_nfts_minted : nat64;
 };
-
-type UserStats = record {
-  current_streak : nat32;
-  max_streak : nat32;
-  last_day : nat32;
-  total_pixels : nat64;
+// Global game state. Single value, kept in a StableCell.
+type GameState = record {
+  // Timestamp (ns) when the final stage (500x500) was reached.
+  // `None` until then. Once set, the season ends 7 days later.
+  final_stage_reached_at : opt nat64;
+  // Operational ICP buffer (e8s) the canister keeps on hand instead of
+  // distributing to NFT holders. `None` falls back to the default
+  // `DEFAULT_TREASURY_BUFFER_E8S` (20 ICP). Tunable at runtime by
+  // controllers via `admin_set_treasury_buffer`. Option per MIGRATION.md.
+  treasury_operational_buffer_e8s : opt nat64;
+  total_pixels_placed : nat64;
+  season : nat32;
+  // Last season for which `distribute_treasury` ran successfully. Acts
+  // as both the dedup guard (one distribution per season) and the
+  // in-progress sentinel — set at the start of distribution, never
+  // reset on success. `None` means no distribution has ever run.
+  // Option for upgrade-safety per MIGRATION.md.
+  treasury_last_distributed_season : opt nat32;
+  // Name of the last alliance whose mission was completed and NFT minted.
+  // Updated by `maybe_mint_for_pixel` on successful mint. Option per
+  // MIGRATION.md.
+  last_completed_mission_name : opt text;
+  unique_pixels_set : nat64;
+  // Global reward pool balance in e8s. Accumulates the `reward_pool_pct`
+  // share of every payment. Money is distributed to completed missions
+  // on each incoming payment; this field holds only the undistributed
+  // remainder (e.g. when no missions are completed yet). Option for
+  // upgrade-safety per MIGRATION.md.
+  reward_pool_balance_e8s : opt nat64;
+  // Reward pool balance in e8s of ICP. Conceptually = treasury balance.
+  // Incremented by `billing::credit_treasury` whenever a player pays for
+  // a pixel or for an alliance creation (treasury_pct of the fee). Locked
+  // into a `MissionRound.reward_pool_e8s` when a round completes.
+  // 
+  // In free mode (`pixel_price_usd_cents == 0` and no real ICRC-2 wiring)
+  // this stays at 0 — the contribution-tracking machinery is wired today
+  // but the pool will only fill once Phase 2 enables real payments.
+  // 
+  // Stored as `Option<u64>` so existing GameState bytes (which lack this
+  // field) decode cleanly after upgrade. `None` is treated as 0.
+  treasury_balance_e8s : opt nat64;
+  map_size : nat16;
+  // Global kill-switch. When `true`, all state-mutating gameplay endpoints
+  // (place_pixel, create_alliance, join/leave, upgrade_mission, ...) return
+  // `Paused`. Toggled by `admin_set_paused`. Survives canister upgrades.
+  paused : bool;
+  // Timestamp (ns) when the last mission was completed (NFT minted).
+  // Option per MIGRATION.md.
+  last_completed_mission_at : opt nat64;
 };
-
-type StreakEntry = record {
-  user : principal;
-  current_streak : nat32;
-  max_streak : nat32;
-  total_pixels : nat64;
-};
-
-type IcpUsdCache = record {
-  usd_per_icp_micro : nat64;
-  last_fetched_ns : nat64;
-};
-
-// HTTP gateway (certified-HTTP) request/response. Different shape than the
-// TransformHttpResponse above — these match the IC HTTP gateway spec, used
-// for serving content like /og.png via boundary-node URLs.
-type HttpGatewayRequest = record {
-  method : text;
+type HttpRequest = record {
   url : text;
-  headers : vec record { text; text };
+  method : text;
   body : blob;
+  headers : vec record { text; text };
 };
-type HttpGatewayResponse = record {
+type HttpResponse = record {
+  body : blob;
+  headers : vec record { text; text };
   status_code : nat16;
-  headers : vec record { text; text };
-  body : blob;
 };
-
-type BuyPixelsResult = variant { Ok : nat64; Err : text };
-type RefreshIcpPriceResult = variant { Ok : IcpUsdCache; Err : text };
-
-type PlaceResult = variant {
-  Ok;
-  Err : PlaceError;
+// USD per 1 ICP, scaled by 1e6 (so $6.4321 → 6_432_100). 0 means "never
+// fetched". Stored alongside the fetch timestamp.
+type IcpUsdCache = record {
+  last_fetched_ns : nat64;
+  usd_per_icp_micro : nat64;
 };
-
+// One entry in a leaderboard page. `rank` is 1-based, computed by sorting
+// all alliances by (pixels_captured desc, id asc) for a stable tie-break.
+type LeaderboardEntry = record { alliance : AlliancePublic; rank : nat32 };
+// Paginated leaderboard. `total` is the total alliance count (for pagination
+// UI). `top_pixels` is the #1 alliance's pixel count, used by the frontend
+// to render proportional bars. `my_entry` is the caller's own entry if they
+// are in an alliance — included even when outside the requested page so the
+// UI can always show "your rank".
+type LeaderboardPage = record {
+  total : nat64;
+  my_entry : opt LeaderboardEntry;
+  entries : vec LeaderboardEntry;
+  top_pixels : nat64;
+};
 type Mission = record {
+  // Top-left corner in centered coordinates ((0,0) is map center).
   x : int16;
   y : int16;
-  width : nat16;
   height : nat16;
   template : vec nat32;
-};
-
-type Alliance = record {
-  id : nat64;
-  name : text;
-  description : text;
-  leader : principal;
-  members : vec principal;
-  mission : Mission;
-  created_at : nat64;
-  pixels_captured : nat64;
-  nft_token_id : opt nat64;
-  prev_nft_token_id : opt nat64;
-  nft_mint_in_progress : bool;
-};
-
-type AlliancePublic = record {
-  id : nat64;
-  name : text;
-  description : text;
-  leader : principal;
-  member_count : nat32;
-  created_at : nat64;
-  pixels_captured : nat64;
-  nft_token_id : opt nat64;
-  website : opt text;
-};
-
-type AllianceError = variant {
-  Unauthorized;
-  NotFound;
-  AlreadyInAlliance;
-  NotInAlliance;
-  InvalidMission : text;
-  NameEmpty;
-  NameTooLong;
-  DescriptionTooLong;
-  NotLeader;
-  MissionNotComplete;
-  UpgradeMustContainOld;
-  OldPixelsModified;
-  MissionAreaAlreadyPainted : nat8;
-  NftCanisterNotConfigured;
-  NftMintFailed : text;
-  NftNotBurned;
-  PaymentFailed : text;
-  Paused;
-  InternalError : text;
-  RoundNotFound;
-  RoundNotCompleted;
-  NoContribution;
-  AlreadyClaimed;
-  InvalidWebsite : text;
-};
-
-type MissionRoundPublic = record {
-  round_index : nat32;
-  x : int16;
-  y : int16;
   width : nat16;
-  height : nat16;
-  started_at : nat64;
-  completed_at : opt nat64;
-  pixel_count : nat64;
-  member_contributor_count : nat32;
-  helper_contributor_count : nat32;
-  credited_cells_count : nat64;
-  reward_pool_e8s : nat64;
-  claimed_count : nat32;
-  nft_token_id : opt nat64;
 };
-
+// Caller-scoped contribution view: how much I've contributed to a given
+// round and what my share is (or would be) when it closes.
 type MissionContributionView = record {
-  round_index : nat32;
-  completed : bool;
-  member_pixels : nat32;
-  helper_pixels : nat32;
+  reward_pool_e8s : nat64;
+  // My weight in the round = `member_pixels * 2 + helper_pixels` (we keep
+  // integer math by scaling everything ×2).
   my_weight : nat64;
   total_weight : nat64;
-  reward_pool_e8s : nat64;
-  estimated_share_e8s : nat64;
-  claimed : bool;
-};
-
-type ClaimResult = record {
-  share_e8s : nat64;
-  transferred : bool;
-};
-
-type ClaimMissionRewardResult = variant { Ok : ClaimResult; Err : AllianceError };
-type MissionContributionResult = variant { Ok : MissionContributionView; Err : AllianceError };
-
-type SetBillingResult = variant { Ok; Err : text };
-
-type SetNftCanisterResult = variant { Ok; Err : text };
-
-type LeaderboardEntry = record {
-  rank : nat32;
-  alliance : AlliancePublic;
-};
-
-type LeaderboardPage = record {
-  entries : vec LeaderboardEntry;
-  total : nat64;
-  top_pixels : nat64;
-  my_entry : opt LeaderboardEntry;
-};
-
-type MissionStatus = record {
-  matched : nat32;
-  total : nat32;
-  percent : nat8;
   completed : bool;
+  claimed : bool;
+  helper_pixels : nat32;
+  // Estimated share if the round completed right now. For an already-
+  // completed round this is the actual share. 0 in free mode.
+  estimated_share_e8s : nat64;
+  round_index : nat32;
+  member_pixels : nat32;
 };
-
-type CheckMissionResult = variant { Ok : MissionStatus; Err : AllianceError };
-
-type CreateAllianceResult = variant { Ok : nat64; Err : AllianceError };
-type AllianceUnitResult = variant { Ok; Err : AllianceError };
-
-type AllianceOrPublic = variant {
-  Full : Alliance;
-  Public : AlliancePublic;
+type MissionRound = record {
+  // Per-principal total e8s already claimed. Allows re-claiming the
+  // delta since last claim as pool grows.
+  claimed_amounts : opt vec record { principal; nat64 };
+  // Total e8s already claimed from `accumulated_pool_e8s`. Tracked so
+  // players can re-claim as the pool grows (continuous flow model).
+  total_claimed_e8s : opt nat64;
+  // Accumulated reward pool for this round, fed continuously by
+  // `credit_reward_pool` proportional to this round's pixel_count
+  // relative to all completed rounds. Players claim from this pool.
+  // Replaces the old lump-sum `reward_pool_e8s` lock model.
+  accumulated_pool_e8s : opt nat64;
+  // Reward pool locked from treasury at round completion. 0 until then.
+  // Free mode (price = 0) yields 0 here too — the math is wired but
+  // payouts are no-ops.
+  reward_pool_e8s : nat64;
+  // Bitmap with `ceil(width*height / 8)` bytes. Bit i (row-major) = 1
+  // means cell i has already been credited in this round → no further
+  // placements can earn credit for it (first-correct-pixel-wins). This
+  // makes overwrite a dead-loss for the saboteur.
+  credited_cells : blob;
+  // Sum of correct-placement counts per principal who is currently a
+  // member of the alliance at the time the cell was credited. Each entry
+  // counts at weight ×1.
+  contributions : vec record { principal; nat32 };
+  // `Some(token_id)` once the NFT for this round was minted. Mirrors
+  // the active-round NFT in `Alliance.nft_token_id` for read-side
+  // convenience; closed rounds keep their original token id here.
+  nft_token_id : opt nat64;
+  // Snapshot of the mission target this round was opened with. We don't
+  // reach back into Alliance.mission so that closed rounds keep their
+  // original (smaller) template even after upgrades enlarge the active
+  // mission.
+  mission : Mission;
+  // Maps cell_index → Principal who last placed the correct color.
+  // Used for "last-correct-wins" credit model: when a cell is repaired
+  // after sabotage, the repairer gets the credit and the original
+  // placer's count is decremented. Option for upgrade-safety.
+  cell_creditors : opt vec record { nat32; principal };
+  // Principals who have already called `claim_mission_reward` for this
+  // round. Idempotent guard.
+  claimed_principals : vec principal;
+  // 0-based index in the alliance's rounds vector. Round 0 is the
+  // alliance's initial mission; each `upgrade_mission` appends one.
+  round_index : nat32;
+  // Set the moment the round crosses 95% match. Stays `None` until then.
+  completed_at : opt nat64;
+  started_at : nat64;
+  // Same shape but for non-member helpers — counted at weight ×0.5 in
+  // the share calculation.
+  helper_contributions : vec record { principal; nat32 };
 };
-
-type PixelChange = record {
+// Public DTO returned by `get_mission_rounds`. Strips heavy fields
+// (template, bitmap, full contributions) so the response stays small for
+// list views. Detailed contribution data is fetched per-round via
+// `my_mission_contribution`.
+type MissionRoundPublic = record {
   x : int16;
   y : int16;
-  color : nat32;
+  height : nat16;
+  reward_pool_e8s : nat64;
+  member_contributor_count : nat32;
+  nft_token_id : opt nat64;
+  helper_contributor_count : nat32;
+  claimed_count : nat32;
+  pixel_count : nat64;
+  credited_cells_count : nat64;
+  round_index : nat32;
+  width : nat16;
+  completed_at : opt nat64;
+  started_at : nat64;
 };
-
-type ChangesResponse = record {
-  changes : vec PixelChange;
-  current_version : nat64;
-  min_version : nat64;
-  map_size : nat16;
-  next_version : nat64;
+type MissionStatus = record {
+  total : nat32;
+  completed : bool;
+  percent : nat8;
+  matched : nat32;
 };
-
-type VersionInfo = record {
-  version : nat64;
-  map_size : nat16;
+type MissionTileKey = record { tx : int16; ty : int16 };
+type OrderCreated = record {
+  // 32-byte subaccount as lowercase hex (paste into ICRC-1 wallet).
+  subaccount_hex : text;
+  pack_id : nat8;
+  // Legacy AccountIdentifier (64-char hex) — for NNS dapp / old wallets.
+  account_identifier_hex : text;
+  pack_pixels : nat64;
+  tolerance_below_e8s : nat64;
+  // Canister principal that owns the subaccount (paste into ICRC-1 wallet).
+  owner_principal : principal;
+  expected_e8s : nat64;
+  expires_at_ns : nat64;
+  order_id_hex : text;
 };
-
-service : {
-  place_pixel : (int16, int16, nat32) -> (PlaceResult);
-  get_map_chunk : (nat16, nat16) -> (vec nat32) query;
-  chunk_size : () -> (nat16) query;
-  get_game_state : () -> (GameState) query;
-  get_changes_since : (nat64, opt nat64) -> (ChangesResponse) query;
-  get_version : () -> (VersionInfo) query;
-
-  create_alliance : (text, text, Mission, text) -> (CreateAllianceResult);
-  join_alliance : (nat64) -> (AllianceUnitResult);
-  leave_alliance : () -> (AllianceUnitResult);
-  get_my_alliance : () -> (opt Alliance) query;
-  get_alliance : (nat64) -> (opt AllianceOrPublic) query;
-  list_alliances : () -> (vec AlliancePublic) query;
-  leaderboard : (nat64, nat64) -> (LeaderboardPage) query;
-  check_mission : (nat64) -> (CheckMissionResult) query;
-  upgrade_mission : (nat64, Mission) -> (AllianceUnitResult);
-
-  // Mission rounds & rewards.
-  get_mission_rounds : (nat64) -> (vec MissionRoundPublic) query;
-  my_mission_contribution : (nat64, nat32) -> (MissionContributionResult) query;
-  claim_mission_reward : (nat64, nat32) -> (ClaimMissionRewardResult);
-  get_treasury_balance : () -> (nat64) query;
-  admin_credit_treasury : (nat64) -> (variant { Ok : nat64; Err : text });
-
-  set_nft_canister : (principal) -> (SetNftCanisterResult);
-  get_nft_canister : () -> (opt principal) query;
-
-  get_alliance_billing : () -> (Billing) query;
-  get_alliance_price_usd_cents : () -> (nat16) query;
-  set_alliance_price : (nat64) -> (SetBillingResult);
-  set_alliance_billing : (Billing) -> (SetBillingResult);
-
-  admin_set_paused : (bool) -> (SetBillingResult);
-
-  // Health probe — open query, used by frontend admin badge and any
-  // external uptime monitor. cycles is the canister's current cycle
-  // balance; stable_pages is in 64KiB pages.
-  get_health : () -> (record {
-    cycles : nat64;
-    stable_pages : nat64;
-    low_cycles_warning : bool;
-  }) query;
-
-  get_pixel_credits : (principal) -> (nat64) query;
-  my_pixel_credits : () -> (nat64) query;
-  admin_grant_credits : (principal, nat64) -> (SetBillingResult);
-  buy_pixels : (nat64) -> (BuyPixelsResult);
-
-  // Batched wallet payout. Drains WALLET_PENDING_E8S via one icrc1_transfer
-  // to billing.wallet_principal. Returns the amount actually paid out
-  // (minus the ledger fee) or an error.
-  admin_payout_wallet : () -> (variant { Ok : nat64; Err : text });
-  get_wallet_pending_e8s : () -> (nat64) query;
-
-  // End-of-season treasury distribution.
-  distribute_treasury : () -> (DistributeTreasuryResult);
-  claim_treasury : () -> (ClaimTreasuryResult);
-  get_claimable_treasury : (principal) -> (nat64) query;
-  my_claimable_treasury : () -> (nat64) query;
-  admin_reset_treasury_distribution : () -> (SetBillingResult);
-  admin_set_treasury_buffer : (nat64) -> (SetBillingResult);
-
+// State machine for a pixel-pack deposit order.
+type OrderStatus = variant {
+  // A controller manually swept this order's subaccount out to a
+  // different principal (support / refund flow).
+  Rescued : record { to : principal; block_index : nat64; amount_e8s : nat64 };
+  // Balance on the subaccount reached the expected amount (within
+  // tolerance); funds have been swept to the canister's main account,
+  // pixels credited, and split done.
+  Paid : record {
+    settled_e8s : nat64;
+    block_index : nat64;
+    pixels_credited : nat64;
+  };
+  // TTL window elapsed before enough ICP arrived. Any funds still on
+  // the subaccount are salvageable only via `admin_rescue_order`.
+  Expired;
+  // Waiting for the player to send ICP to the deposit subaccount.
+  Pending;
+};
+type OrderView = record {
+  status : OrderStatus;
+  pack_id : nat8;
+  created_at_ns : nat64;
+  current_balance_e8s : nat64;
+  buyer : principal;
+  expected_e8s : nat64;
+  expires_at_ns : nat64;
+  order_id_hex : text;
+};
+type PendingOrder = record {
+  status : OrderStatus;
+  "principal" : principal;
+  pack_id : nat8;
+  created_at_ns : nat64;
+  order_id : blob;
+  expected_e8s : nat64;
+  expires_at_ns : nat64;
+};
+// A single pixel on the map.
+// `owner` is `None` until we add Internet Identity in a later phase.
+type Pixel = record { owner : opt principal; color : nat32; timestamp : nat64 };
+// A single change in the change log. Coordinates are centered (signed).
+type PixelChange = record { x : int16; y : int16; color : nat32 };
+// Key into the pixel map: (x, y) in **centered** coordinates. (0,0) is the
+// geometric center of the map; valid range for size N is `[-(N/2)..(N+1)/2)`,
+// i.e. for N=5: `-2..=2`, for N=10: `-5..=4`.
+type PixelKey = record { x : int16; y : int16 };
+// A fixed-price pixel pack.
+type PixelPack = record {
+  id : nat8;
+  pixels : nat64;
+  // Total pack price in e8s (1 ICP = 100_000_000 e8s).
+  price_e8s : nat64;
+};
+type PlaceError = variant {
+  OutOfBounds;
+  // Admin has paused the game (maintenance / incident response).
+  Paused;
+  SeasonEnded;
+  Unauthorized;
+  InvalidColor;
+  Cooldown : record { remaining_ns : nat64 };
+  // Unexpected stable-memory write failure. Transaction rolls back.
+  // Caller should retry; if persistent, it's a bug worth investigating.
+  InternalError : text;
+  // Billing is on and the caller has zero pixel credits — they need to
+  // buy more via `buy_pixels` before placing again.
+  NoCredits;
+};
+type Result = variant { Ok : nat64; Err : text };
+type Result_1 = variant { Ok; Err : text };
+type Result_10 = variant { Ok; Err : PlaceError };
+type Result_2 = variant { Ok : MissionStatus; Err : AllianceError };
+type Result_3 = variant { Ok : OrderView; Err : text };
+type Result_4 = variant { Ok : ClaimResult; Err : AllianceError };
+type Result_5 = variant { Ok : nat64; Err : AllianceError };
+type Result_6 = variant { Ok : OrderCreated; Err : text };
+type Result_7 = variant { Ok : DistributeReport; Err : text };
+type Result_8 = variant { Ok; Err : AllianceError };
+type Result_9 = variant { Ok : MissionContributionView; Err : AllianceError };
+// Per-user streak stats. Stored in `USER_STATS` stable map (MemoryId 16).
+// Updated on every `place_pixel`: if the player placed yesterday →
+// current_streak += 1; if they skipped a day → reset to 1.
+type UserStats = record {
+  // Highest streak this user ever achieved.
+  max_streak : nat32;
+  // Current consecutive-day streak.
+  current_streak : nat32;
+  // Total pixels this user has ever placed.
+  total_pixels : nat64;
+  // Day number (days since epoch) of the last pixel placement.
+  // Used to detect "yesterday" vs "gap".
+  last_day : nat32;
+};
+// Tiny version probe — used for cheap polling. Total ~10 bytes on the wire.
+type VersionInfo = record { version : nat64; map_size : nat16 };
+service : () -> {
+  // Test-only: inject e8s into the mission reward pool as if real payments
+  // came in. Controller-only.
+  admin_credit_reward_pool : (nat64) -> (Result);
+  // Controller-only. Manually bump the treasury counter — used for testing
+  // the reward-pool / claim flow without having to wire ICRC-2 first. On
+  // mainnet this stays callable but should never be needed: real payments
+  // will fill the treasury automatically.
+  admin_credit_treasury : (nat64) -> (Result);
+  admin_export_alliance_rounds : (nat64, nat64) -> (
+      vec record { nat64; vec MissionRound },
+    ) query;
+  admin_export_alliances : (nat64, nat64) -> (
+      vec record { nat64; Alliance },
+    ) query;
+  admin_export_changes : (nat64, nat64) -> (
+      vec record { nat64; PixelChange },
+    ) query;
+  admin_export_claimable_treasury : (nat64, nat64) -> (
+      vec record { principal; nat64 },
+    ) query;
+  admin_export_counts : () -> (ExportCounts) query;
+  admin_export_last_placed : (nat64, nat64) -> (
+      vec record { principal; nat64 },
+    ) query;
+  admin_export_mission_tile_index : (nat64, nat64) -> (
+      vec record { MissionTileKey; vec nat64 },
+    ) query;
+  admin_export_pending_orders : (nat64, nat64) -> (
+      vec record { blob; PendingOrder },
+    ) query;
+  // Raw flat pixel-color region as bytes. Each pixel is a little-endian
+  // u32: bit 24 = painted flag, low 24 bits = 0xRRGGBB. Unpainted cells
+  // read as 0. See `state::write_pixel_color` for the stored layout.
+  admin_export_pixel_colors : (nat64, nat64) -> (blob) query;
+  admin_export_pixel_credits : (nat64, nat64) -> (
+      vec record { principal; nat64 },
+    ) query;
+  admin_export_pixels : (nat64, nat64) -> (
+      vec record { PixelKey; Pixel },
+    ) query;
+  admin_export_singletons : () -> (ExportSingletons) query;
+  admin_export_user_alliance : (nat64, nat64) -> (
+      vec record { principal; nat64 },
+    ) query;
+  admin_export_user_stats : (nat64, nat64) -> (
+      vec record { principal; UserStats },
+    ) query;
+  admin_set_snapshot_reader : (opt principal) -> (Result_1);
+  get_snapshot_reader : () -> (opt principal) query;
+  // Controller-only. Grants free credits to a player — used during testing.
+  // On mainnet with the real ledger wired, players will call `buy_pixels`
+  // instead and this endpoint becomes dev-only.
+  admin_grant_credits : (principal, nat64) -> (Result_1);
+  // Controller-only. Drains the accumulated wallet share from
+  // `WALLET_PENDING_E8S` via a single `icrc1_transfer` to
+  // `billing.wallet_principal`. Batching drastically cuts ledger fee
+  // waste — one drain call per day replaces ~N×10k e8s fees where N is
+  // the number of purchases.
+  // 
+  // On ledger failure we leave the pending counter intact so the admin
+  // can retry. On success we reset it to zero atomically.
+  admin_payout_wallet : () -> (Result);
+  // Controller-only. Sweep the subaccount of a (typically Expired or stuck)
+  // order to an arbitrary target principal. Used for manual support when
+  // a player sent the wrong amount or after the TTL window. Marks the
+  // order `Rescued` so it can't be double-claimed.
+  admin_rescue_order : (text, principal) -> (Result);
+  // Controller-only. Clears the per-season distribution guard so a failed
+  // distribution can be retried. Use with care: re-running for the same
+  // season after partial success would double-credit holders.
+  admin_reset_treasury_distribution : () -> (Result_1);
+  // Debug: force-set map size to a specific stage. Controller-only.
+  // Used to test map growth without filling 250k pixels.
+  admin_set_map_size : (nat16) -> (Result_1);
+  // Controller-only. Global pause flag. While paused, all state-mutating
+  // gameplay endpoints (place_pixel, create/join/leave alliance,
+  // upgrade_mission, ...) return `Paused`. Query endpoints stay open so
+  // clients can still read state and display a maintenance banner.
+  admin_set_paused : (bool) -> (Result_1);
+  // Controller-only. Override the operational ICP buffer (e8s) the
+  // canister keeps on hand instead of distributing.
+  admin_set_treasury_buffer : (nat64) -> (Result_1);
   am_i_controller : () -> (bool) query;
-  get_admin_stats : () -> (AdminStats) query;
-
-  get_top_streaks : (nat64) -> (vec StreakEntry) query;
-  my_stats : () -> (UserStats) query;
-
-  refresh_icp_price : () -> (RefreshIcpPriceResult);
-  get_icp_price : () -> (IcpUsdCache) query;
-
-  // HTTP gateway endpoint — serves /og.png for link previews.
-  http_request : (HttpGatewayRequest) -> (HttpGatewayResponse) query;
-
+  check_mission : (nat64) -> (Result_2) query;
+  // Poll the status of an order. Called repeatedly by the frontend while
+  // the purchase modal is open. Does a live balance read; if funds have
+  // arrived it sweeps + settles + credits pixels in this call. Safe to
+  // call from any caller (order_id is an unguessable 128-bit capability).
+  check_order : (text) -> (Result_3);
+  chunk_size : () -> (nat16) query;
+  claim_mission_reward : (nat64, nat32) -> (Result_4);
+  // User-facing pull. Drains the caller's claimable share from the
+  // season distribution into their account via `icrc1_transfer`. The
+  // ledger fee is taken from the credited amount.
+  claim_treasury : () -> (Result);
+  create_alliance : (text, text, Mission, text) -> (Result_5);
+  // Create a deposit order for the given pack. Rejects anonymous callers.
+  // Returns the deposit address (owner + subaccount in both ICRC-1 and
+  // legacy AccountIdentifier form) plus the expected amount.
+  create_order : (nat8) -> (Result_6);
+  // Debug: paint `percent`% of the current map with a sweep of palette
+  // colors. Bypasses cooldown / billing / auth. Controller-only.
   debug_fill : (nat8) -> (nat64);
+  // Controller-only. Splits the canister's spare ICP balance 40/60 between
+  // the owner and the season's NFT holders. Holder shares are written to a
+  // pull-claim map; the owner cut is pushed via `icrc1_transfer`. The
+  // owner principal is `billing.wallet_principal` — that's where the
+  // project's actual wallet lives. Idempotent per season.
+  distribute_treasury : () -> (Result_7);
+  get_admin_stats : () -> (AdminStats) query;
+  get_alliance : (nat64) -> (opt AllianceOrPublic) query;
+  get_alliance_billing : () -> (Billing) query;
+  get_changes_since : (nat64, opt nat64) -> (ChangesResponse) query;
+  get_claimable_treasury : (principal) -> (nat64) query;
+  get_game_state : () -> (GameState) query;
+  get_health : () -> (CanisterHealth) query;
+  get_map_chunk : (nat16, nat16) -> (vec nat32) query;
+  get_mission_rounds : (nat64) -> (vec MissionRoundPublic) query;
+  get_my_alliance : () -> (opt Alliance) query;
+  get_nft_canister : () -> (opt principal) query;
+  // Query the available pixel packs and their prices.
+  get_packs : () -> (vec PixelPack) query;
+  get_pixel_credits : (principal) -> (nat64) query;
+  get_treasury_balance : () -> (nat64) query;
+  get_version : () -> (VersionInfo) query;
+  get_wallet_pending_e8s : () -> (nat64) query;
+  // HTTP gateway entry point. Serves the `/og.png` Open Graph preview image
+  // used by Twitter/Discord/Telegram link cards. All other paths 404.
+  http_request : (HttpRequest) -> (HttpResponse) query;
+  join_alliance : (nat64) -> (Result_8);
+  leaderboard : (nat64, nat64) -> (LeaderboardPage) query;
+  leave_alliance : () -> (Result_8);
+  list_alliances : () -> (vec AlliancePublic) query;
+  my_claimable_treasury : () -> (nat64) query;
+  my_mission_contribution : (nat64, nat32) -> (Result_9) query;
+  // List all orders created by the caller (most recent first). Queries are
+  // capped at 50 to avoid unbounded scans; terminal orders beyond that can
+  // be fetched individually via `check_order`.
+  my_orders : () -> (vec OrderView) query;
+  my_pixel_credits : () -> (nat64) query;
+  place_pixel : (int16, int16, nat32) -> (Result_10);
+  set_alliance_billing : (Billing) -> (Result_1);
+  set_alliance_price : (nat64) -> (Result_1);
+  set_nft_canister : (principal) -> (Result_1);
+  upgrade_mission : (nat64, Mission) -> (Result_8);
 }

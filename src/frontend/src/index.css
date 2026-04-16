@@ -476,3 +476,29 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* ── Mobile ──────────────────────────────────────────────────────── */
+@media (max-width: 768px) {
+  /* Nav bar: tighter spacing */
+  .nav-bar--mobile {
+    padding: 4px 8px;
+    gap: 2px;
+  }
+  .nav-bar--mobile .nav-brand {
+    font-size: 12px;
+    margin-right: 6px;
+  }
+  .nav-bar--mobile .nav-tab {
+    padding: 6px 8px;
+    font-size: 11px;
+  }
+  .nav-bar--mobile .btn {
+    padding: 5px 10px;
+    font-size: 11px;
+  }
+
+  /* Tooltips: hidden on mobile (no hover) */
+  [data-tip]::after {
+    display: none !important;
+  }
+}

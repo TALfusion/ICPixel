@@ -15,7 +15,8 @@
     "frontend": {
       "type": "assets",
       "source": ["src/frontend/dist"],
-      "dependencies": ["backend", "nft", "internet_identity"]
+      "dependencies": ["backend", "nft", "internet_identity"],
+      "build": ["sh -c 'cd src/frontend && npm run build'"]
     },
     "internet_identity": {
       "type": "custom",

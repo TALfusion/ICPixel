@@ -1,7 +1,7 @@
 use crate::alliance_types::{
     Alliance, AllianceId, AllianceIdList, AllianceRounds, MissionRound, MissionTileKey,
 };
-use crate::billing::Billing;
+use crate::billing::{Billing, OrderId, PendingOrder};
 use crate::icp_price::IcpUsdCache;
 use crate::types::{GameState, Pixel, PixelChange, PixelKey, UserStats};
 use candid::Principal;
@@ -47,6 +47,16 @@ const MEM_USER_STATS: MemoryId = MemoryId::new(16);
 /// reads/writes at fixed offsets — ~200× cheaper than BTreeMap per pixel.
 /// Sized for MAX_SIZE=512 (covers 500×500 final stage with padding).
 const MEM_PIXEL_COLORS: MemoryId = MemoryId::new(17);
+/// Pending deposit orders for pixel-pack purchases. Keyed by 16-byte
+/// `OrderId` (also serves as the subaccount prefix where the player
+/// deposits ICP). Terminal orders (Paid / Expired / Rescued) are kept
+/// in place for audit + admin rescue; there's no auto-GC.
+const MEM_PENDING_ORDERS: MemoryId = MemoryId::new(18);
+/// Principal of a designated "snapshot reader". This identity can call
+/// `admin_export_*` (read-only) but has NO other privileges. Used by
+/// the GitHub Actions scheduled backup so we don't have to ship a
+/// full controller key to CI.
+const MEM_SNAPSHOT_READER: MemoryId = MemoryId::new(19);
 
 thread_local! {
     static MEMORY_MANAGER: RefCell<MemoryManager<DefaultMemoryImpl>> =
@@ -179,6 +189,41 @@ thread_local! {
         RefCell::new(StableBTreeMap::init(
             MEMORY_MANAGER.with(|m| m.borrow().get(MEM_USER_STATS)),
         ));
+
+    /// Pending deposit-order registry. Lookup is by `OrderId` (the same
+    /// bytes also derive the subaccount we watch). `my_orders` does a
+    /// linear scan filtered by `principal`; OK for MVP (orders die fast
+    /// once swept or expired; admin can delete terminal rows later).
+    pub static PENDING_ORDERS: RefCell<StableBTreeMap<OrderId, PendingOrder, Memory>> =
+        RefCell::new(StableBTreeMap::init(
+            MEMORY_MANAGER.with(|m| m.borrow().get(MEM_PENDING_ORDERS)),
+        ));
+
+    /// Principal of the read-only "snapshot reader" identity. Set via
+    /// `admin_set_snapshot_reader`. Wrapped in `NftCanisterCell` only to
+    /// reuse its existing `Storable` impl for `Option<Principal>`.
+    pub static SNAPSHOT_READER: RefCell<StableCell<NftCanisterCell, Memory>> = RefCell::new(
+        StableCell::init(
+            MEMORY_MANAGER.with(|m| m.borrow().get(MEM_SNAPSHOT_READER)),
+            NftCanisterCell(None),
+        ).expect("init SNAPSHOT_READER"),
+    );
+}
+
+/// Returns the currently-set snapshot reader principal (if any).
+pub fn snapshot_reader() -> Option<Principal> {
+    SNAPSHOT_READER.with(|c| c.borrow().get().0)
+}
+
+/// Set (or clear, via `None`) the snapshot reader principal. Controller-
+/// gated at the call site in `lib.rs`.
+pub fn set_snapshot_reader(p: Option<Principal>) -> Result<(), String> {
+    SNAPSHOT_READER.with(|c| {
+        c.borrow_mut()
+            .set(NftCanisterCell(p))
+            .map(|_| ())
+            .map_err(|e| format!("set SNAPSHOT_READER: {e:?}"))
+    })
 }
 
 // ───── Flat pixel color array ─────
@@ -229,6 +274,32 @@ pub fn write_pixel_color(x: i16, y: i16, color: u32) {
         let mem = mm.borrow().get(MEM_PIXEL_COLORS);
         mem.write(off, &stored.to_le_bytes());
     });
+}
+
+/// Total size (bytes) of the flat pixel-color region, as grown by
+/// `init_pixel_colors`. Used by admin snapshot export to pre-size the
+/// download and paginate `admin_export_pixel_colors`.
+pub fn pixel_colors_region_bytes() -> u64 {
+    FLAT_PIXEL_BYTES
+}
+
+/// Raw-byte read out of the flat pixel region. Byte layout is an array
+/// of little-endian u32s with bit 24 as the "painted" flag (see
+/// `write_pixel_color`). Used only by the admin snapshot export path,
+/// which slices the region into chunks and reassembles client-side.
+pub fn read_pixel_colors_raw(offset: u64, len: u64) -> Vec<u8> {
+    let total = FLAT_PIXEL_BYTES;
+    if offset >= total {
+        return Vec::new();
+    }
+    let end = offset.saturating_add(len).min(total);
+    let take = (end - offset) as usize;
+    let mut out = vec![0u8; take];
+    MEMORY_MANAGER.with(|mm| {
+        let mem = mm.borrow().get(MEM_PIXEL_COLORS);
+        mem.read(offset, &mut out);
+    });
+    out
 }
 
 /// Read a pixel color from the flat array. Returns DEFAULT_PIXEL_COLOR

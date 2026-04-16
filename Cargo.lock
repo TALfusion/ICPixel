@@ -40,12 +40,15 @@ name = "backend"
 version = "0.1.0"
 dependencies = [
  "candid",
+ "crc32fast",
+ "hex",
  "ic-cdk",
  "ic-cdk-timers",
  "ic-stable-structures",
  "png",
  "serde",
  "serde_bytes",
+ "sha2",
 ]
 
 [[package]]

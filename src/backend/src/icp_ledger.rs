@@ -162,6 +162,77 @@ pub async fn balance_of(ledger: Principal, owner: Principal) -> Result<u64, Stri
     Ok(nat_to_u64(&res))
 }
 
+/// Query the balance of a specific subaccount of `owner`. Used by the
+/// deposit-order flow to poll whether a player has funded their order.
+pub async fn balance_of_subaccount(
+    ledger: Principal,
+    owner: Principal,
+    subaccount: [u8; 32],
+) -> Result<u64, String> {
+    let arg = Account {
+        owner,
+        subaccount: Some(serde_bytes::ByteBuf::from(subaccount.to_vec())),
+    };
+    let (res,): (Nat,) = ic_cdk::call(ledger, "icrc1_balance_of", (arg,))
+        .await
+        .map_err(|(code, msg)| format!("ledger icrc1_balance_of: {code:?} {msg}"))?;
+    Ok(nat_to_u64(&res))
+}
+
+/// Move `amount` e8s *out of* one of our own subaccounts to a principal's
+/// default account (typically this canister's main account during a sweep,
+/// or a rescue target during admin_rescue_order). `from_subaccount` is
+/// ours — we're the owner; we don't need approvals.
+///
+/// The caller must include the ledger fee in the subaccount balance above
+/// `amount` (or pass `amount = balance - fee`). On `BadFee` we refresh the
+/// cached fee and retry once.
+pub async fn transfer_from_subaccount(
+    ledger: Principal,
+    from_subaccount: [u8; 32],
+    to_owner: Principal,
+    amount: u64,
+) -> Result<u64, String> {
+    let fee = cached_ledger_fee();
+    match icrc1_transfer_from_subaccount_explicit(ledger, from_subaccount, to_owner, amount, fee).await? {
+        Ok(idx) => Ok(idx),
+        Err(TransferError::BadFee { expected_fee }) => {
+            let new_fee = nat_to_u64(&expected_fee);
+            set_ledger_fee(new_fee);
+            // Retry with the refreshed fee. `amount` is left unchanged — the
+            // caller sized it assuming the old fee, so the ledger may now
+            // reject for InsufficientFunds if the new fee is higher. That
+            // path returns Err below for the caller to handle.
+            match icrc1_transfer_from_subaccount_explicit(ledger, from_subaccount, to_owner, amount, new_fee).await? {
+                Ok(idx) => Ok(idx),
+                Err(e) => Err(format!("icrc1_transfer (subaccount) rejected after fee refresh: {e:?}")),
+            }
+        }
+        Err(e) => Err(format!("icrc1_transfer (subaccount) rejected: {e:?}")),
+    }
+}
+
+async fn icrc1_transfer_from_subaccount_explicit(
+    ledger: Principal,
+    from_subaccount: [u8; 32],
+    to_owner: Principal,
+    amount: u64,
+    fee: u64,
+) -> Result<Result<u64, TransferError>, String> {
+    let arg = TransferArg {
+        from_subaccount: Some(serde_bytes::ByteBuf::from(from_subaccount.to_vec())),
+        to: Account { owner: to_owner, subaccount: None },
+        amount: Nat::from(amount),
+        fee: Some(Nat::from(fee)),
+        memo: None,
+        created_at_time: None,
+    };
+    let (res,): (TransferResult,) = ic_cdk::call(ledger, "icrc1_transfer", (arg,))
+        .await
+        .map_err(|(code, msg)| format!("ledger icrc1_transfer: {code:?} {msg}"))?;
+    Ok(res.map(|n| nat_to_u64(&n)))
+}
+
 /// Internal: single `icrc1_transfer` call with an explicit fee. The
 /// public entry points wrap this with retry-on-BadFee logic.
 async fn icrc1_transfer_explicit(

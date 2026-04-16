@@ -1,3 +1,4 @@
+mod admin_export;
 mod alliance;
 mod alliance_types;
 mod billing;
@@ -10,12 +11,16 @@ mod state;
 mod treasury;
 mod types;
 
+use crate::admin_export::{ExportCounts, ExportSingletons};
 use crate::alliance::AllianceOrPublic;
 use crate::alliance_types::{
-    Alliance, AllianceError, AllianceId, AlliancePublic, ClaimResult, LeaderboardPage, Mission,
-    MissionContributionView, MissionRoundPublic, MissionStatus,
+    Alliance, AllianceError, AllianceId, AllianceIdList, AlliancePublic, AllianceRounds,
+    ClaimResult, LeaderboardPage, Mission, MissionContributionView, MissionRoundPublic,
+    MissionStatus, MissionTileKey,
 };
-use crate::types::{ChangesResponse, GameState, MapSnapshot, PlaceError, VersionInfo};
+use crate::billing::PendingOrder;
+use crate::types::{ChangesResponse, GameState, MapSnapshot, Pixel, PixelChange, PixelKey, PlaceError, UserStats, VersionInfo};
+use candid::Principal;
 use ic_cdk::{query, update};
 
 fn caller_or_anon() -> candid::Principal {
@@ -166,6 +171,25 @@ fn get_nft_canister() -> Option<candid::Principal> {
     state::nft_canister()
 }
 
+// ───── Snapshot reader role (read-only export access) ─────
+//
+// Designate one principal that can call `admin_export_*` without being
+// a controller. Used by scheduled GitHub Actions backups so the CI
+// identity never has destructive privileges. Set to `None` to disable.
+
+#[update]
+fn admin_set_snapshot_reader(p: Option<candid::Principal>) -> Result<(), String> {
+    if !ic_cdk::api::is_controller(&ic_cdk::caller()) {
+        return Err("only controllers can set the snapshot reader".into());
+    }
+    state::set_snapshot_reader(p)
+}
+
+#[query]
+fn get_snapshot_reader() -> Option<candid::Principal> {
+    state::snapshot_reader()
+}
+
 // ───── Billing (alliance pricing) ─────
 //
 // All admin endpoints are controller-only. The query is open so frontends
@@ -259,36 +283,213 @@ fn admin_grant_credits(to: candid::Principal, amount: u64) -> Result<(), String>
     Ok(())
 }
 
-/// Buy `count` pixel credits. In **free mode** (`pixel_price_usd_cents == 0`)
-/// this credits immediately without any ledger call. In **paid mode** the
-/// caller must have pre-approved us on the ICP ledger via `icrc2_approve`
-/// for at least `count × price_e8s + ledger_fee`; we then pull the ICP via
-/// `icrc2_transfer_from` and internally split wallet/treasury before
-/// handing out the credits.
-///
-/// Returns the new total credit balance on success, or an error string
-/// describing what went wrong (e.g. ledger unreachable, insufficient
-/// allowance, stale ICP/USD rate).
-#[update]
-async fn buy_pixels(count: u64) -> Result<u64, String> {
-    if count == 0 {
-        return Err("count must be > 0".into());
+/// Query the available pixel packs and their prices.
+#[query]
+fn get_packs() -> Vec<billing::PixelPack> {
+    billing::packs()
+}
+
+// ───── Deposit-order flow ─────
+//
+// Replaces the old `buy_pack(ICRC-2 approve + transfer_from)` flow. Player
+// creates an order → backend returns a unique subaccount + expected amount
+// → player sends ICP from any wallet → `check_order` poll detects payment,
+// sweeps the subaccount, splits, credits pixels.
+
+#[derive(candid::CandidType, serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct OrderCreated {
+    pub order_id_hex: String,
+    pub pack_id: u8,
+    pub pack_pixels: u64,
+    pub expected_e8s: u64,
+    pub tolerance_below_e8s: u64,
+    pub expires_at_ns: u64,
+    /// Canister principal that owns the subaccount (paste into ICRC-1 wallet).
+    pub owner_principal: candid::Principal,
+    /// 32-byte subaccount as lowercase hex (paste into ICRC-1 wallet).
+    pub subaccount_hex: String,
+    /// Legacy AccountIdentifier (64-char hex) — for NNS dapp / old wallets.
+    pub account_identifier_hex: String,
+}
+
+#[derive(candid::CandidType, serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct OrderView {
+    pub order_id_hex: String,
+    pub pack_id: u8,
+    pub buyer: candid::Principal,
+    pub expected_e8s: u64,
+    pub created_at_ns: u64,
+    pub expires_at_ns: u64,
+    pub status: billing::OrderStatus,
+    pub current_balance_e8s: u64,
+}
+
+fn view_of(order: &billing::PendingOrder, balance: u64) -> OrderView {
+    OrderView {
+        order_id_hex: order.order_id.hex(),
+        pack_id: order.pack_id,
+        buyer: order.principal,
+        expected_e8s: order.expected_e8s,
+        created_at_ns: order.created_at_ns,
+        expires_at_ns: order.expires_at_ns,
+        status: order.status.clone(),
+        current_balance_e8s: balance,
     }
+}
+
+/// Create a deposit order for the given pack. Rejects anonymous callers.
+/// Returns the deposit address (owner + subaccount in both ICRC-1 and
+/// legacy AccountIdentifier form) plus the expected amount.
+#[update]
+async fn create_order(pack_id: u8) -> Result<OrderCreated, String> {
     let caller = caller_or_anon();
     if caller == candid::Principal::anonymous() {
         return Err("login required".into());
     }
-    // Charge the caller — no-op in free mode, real ICRC-2 in paid mode.
-    // Any payment error propagates before we touch PIXEL_CREDITS, so a
-    // failed charge leaves no credits handed out.
-    billing::charge_pixel_fee(caller, count).await?;
-    let new_total = state::PIXEL_CREDITS.with(|m| {
-        let cur = m.borrow().get(&caller).unwrap_or(0);
-        let next = cur.saturating_add(count);
-        m.borrow_mut().insert(caller, next);
-        next
+    if state::game_state().paused {
+        return Err("game is paused".into());
+    }
+
+    let pack = billing::packs()
+        .into_iter()
+        .find(|p| p.id == pack_id)
+        .ok_or_else(|| format!("unknown pack_id {pack_id}"))?;
+
+    // Generate 16 random bytes for the order id (also becomes subaccount prefix).
+    let (raw,): (Vec<u8>,) = ic_cdk::api::management_canister::main::raw_rand()
+        .await
+        .map_err(|(code, msg)| format!("raw_rand: {code:?} {msg}"))?;
+    if raw.len() < 16 {
+        return Err("raw_rand returned <16 bytes".into());
+    }
+    let mut id_bytes = [0u8; 16];
+    id_bytes.copy_from_slice(&raw[..16]);
+    let order_id = billing::OrderId(id_bytes);
+
+    let now = ic_cdk::api::time();
+    let expires_at = now.saturating_add(billing::ORDER_TTL_NS);
+    let order = billing::PendingOrder {
+        order_id,
+        principal: caller,
+        pack_id: pack.id,
+        expected_e8s: pack.price_e8s,
+        created_at_ns: now,
+        expires_at_ns: expires_at,
+        status: billing::OrderStatus::Pending,
+    };
+    state::PENDING_ORDERS.with(|m| m.borrow_mut().insert(order_id, order));
+
+    let me = ic_cdk::api::id();
+    let subaccount = billing::order_subaccount(order_id);
+    Ok(OrderCreated {
+        order_id_hex: order_id.hex(),
+        pack_id: pack.id,
+        pack_pixels: pack.pixels,
+        expected_e8s: pack.price_e8s,
+        tolerance_below_e8s: billing::UNDER_TOLERANCE_E8S,
+        expires_at_ns: expires_at,
+        owner_principal: me,
+        subaccount_hex: hex::encode(subaccount),
+        account_identifier_hex: billing::account_identifier_hex(me, subaccount),
+    })
+}
+
+/// Poll the status of an order. Called repeatedly by the frontend while
+/// the purchase modal is open. Does a live balance read; if funds have
+/// arrived it sweeps + settles + credits pixels in this call. Safe to
+/// call from any caller (order_id is an unguessable 128-bit capability).
+#[update]
+async fn check_order(order_id_hex: String) -> Result<OrderView, String> {
+    let order_id = billing::OrderId::from_hex(&order_id_hex)?;
+
+    // First pass: settle_order does balance read + sweep + credit if ready.
+    // It's idempotent on terminal states, so calling again after Paid is fine.
+    let _status = billing::settle_order(order_id).await?;
+
+    // Reload current order row (settle_order may have mutated it).
+    let order = state::PENDING_ORDERS
+        .with(|m| m.borrow().get(&order_id))
+        .ok_or_else(|| "order disappeared".to_string())?;
+
+    // Fresh balance read for display (post-sweep this will be ~0 on Paid).
+    let cfg = billing::get();
+    let balance = match cfg.ledger {
+        Some(ledger) => {
+            let sub = billing::order_subaccount(order_id);
+            crate::icp_ledger::balance_of_subaccount(ledger, ic_cdk::api::id(), sub)
+                .await
+                .unwrap_or(0)
+        }
+        None => 0,
+    };
+    Ok(view_of(&order, balance))
+}
+
+/// List all orders created by the caller (most recent first). Queries are
+/// capped at 50 to avoid unbounded scans; terminal orders beyond that can
+/// be fetched individually via `check_order`.
+#[query]
+fn my_orders() -> Vec<OrderView> {
+    let caller = caller_or_anon();
+    let mut out: Vec<billing::PendingOrder> = state::PENDING_ORDERS.with(|m| {
+        m.borrow()
+            .iter()
+            .filter_map(|(_, o)| if o.principal == caller { Some(o) } else { None })
+            .collect()
     });
-    Ok(new_total)
+    // Newest first.
+    out.sort_by(|a, b| b.created_at_ns.cmp(&a.created_at_ns));
+    out.truncate(50);
+    // current_balance_e8s is 0 here (queries can't do inter-canister calls);
+    // frontend should call check_order for live balance.
+    out.iter().map(|o| view_of(o, 0)).collect()
+}
+
+/// Controller-only. Sweep the subaccount of a (typically Expired or stuck)
+/// order to an arbitrary target principal. Used for manual support when
+/// a player sent the wrong amount or after the TTL window. Marks the
+/// order `Rescued` so it can't be double-claimed.
+#[update]
+async fn admin_rescue_order(
+    order_id_hex: String,
+    to: candid::Principal,
+) -> Result<u64, String> {
+    if !ic_cdk::api::is_controller(&ic_cdk::caller()) {
+        return Err("only controllers can rescue orders".into());
+    }
+    let order_id = billing::OrderId::from_hex(&order_id_hex)?;
+    let mut order = state::PENDING_ORDERS
+        .with(|m| m.borrow().get(&order_id))
+        .ok_or_else(|| "order not found".to_string())?;
+    // Refuse to rescue an already-paid or already-rescued order — its
+    // subaccount is empty and the caller probably has the wrong id.
+    if matches!(order.status, billing::OrderStatus::Paid { .. })
+        || matches!(order.status, billing::OrderStatus::Rescued { .. })
+    {
+        return Err("order already settled".into());
+    }
+
+    let cfg = billing::get();
+    let ledger = cfg
+        .ledger
+        .ok_or_else(|| "ledger not configured".to_string())?;
+    let subaccount = billing::order_subaccount(order_id);
+    let balance = icp_ledger::balance_of_subaccount(ledger, ic_cdk::api::id(), subaccount).await?;
+    let fee = icp_ledger::cached_ledger_fee();
+    if balance <= fee {
+        return Err(format!("nothing to rescue (balance {balance} ≤ fee {fee})"));
+    }
+    let amount = balance - fee;
+    let block_index =
+        icp_ledger::transfer_from_subaccount(ledger, subaccount, to, amount).await?;
+
+    order.status = billing::OrderStatus::Rescued {
+        block_index,
+        to,
+        amount_e8s: amount,
+    };
+    state::PENDING_ORDERS.with(|m| m.borrow_mut().insert(order_id, order));
+    Ok(block_index)
 }
 
 /// Controller-only. Drains the accumulated wallet share from
@@ -578,6 +779,7 @@ fn post_upgrade() {
     state::WALLET_PENDING_E8S.with(|c| *c.borrow().get());
     state::CLAIMABLE_TREASURY.with(|m| m.borrow().len());
     state::MISSION_TILE_INDEX.with(|m| m.borrow().len());
+    state::PENDING_ORDERS.with(|m| m.borrow().len());
     // Initialize flat pixel color array (grow stable memory to 16MB if needed).
     state::init_pixel_colors();
     // Migrate pixels from old BTreeMap to flat array (idempotent).

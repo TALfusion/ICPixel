@@ -90,14 +90,125 @@ export default function AdminPanel({ actor, onClose }: Props) {
     } catch (e) { setMsg(String(e)); }
   }
 
-  async function refreshPrice() {
-    setMsg("Fetching XRC rate...");
+  const [exporting, setExporting] = useState(false);
+  async function downloadSnapshot() {
+    setExporting(true);
+    setMsg("Starting snapshot…");
     try {
-      const res = await actor.refresh_icp_price();
-      if ("Err" in res) setMsg("Error: " + res.Err);
-      else setMsg("Rate: " + fmtUsdRate(res.Ok.usd_per_icp_micro));
-    } catch (e) { setMsg(String(e)); }
+      // Everything here is a query call — cheap and non-mutating.
+      // We page each collection in chunks and assemble a single JSON.
+      const counts = await actor.admin_export_counts();
+      const singletons = await actor.admin_export_singletons();
+
+      // Pixel-color region: fetch as raw bytes, then decode client-side
+      // (hex + painted-bit reconstruction happens at restore time).
+      const totalPixelBytes = Number(counts.pixel_colors_bytes);
+      const PIXEL_CHUNK = 512 * 1024; // 512 KB per request (safely under 2 MB query cap)
+      const pixelChunks: number[] = [];
+      for (let o = 0; o < totalPixelBytes; o += PIXEL_CHUNK) {
+        setMsg(`pixel colors: ${Math.round((o / totalPixelBytes) * 100)}%`);
+        const bytes = (await actor.admin_export_pixel_colors(
+          BigInt(o),
+          BigInt(Math.min(PIXEL_CHUNK, totalPixelBytes - o)),
+        )) as Uint8Array | number[];
+        const arr = bytes instanceof Uint8Array ? Array.from(bytes) : (bytes as number[]);
+        pixelChunks.push(...arr);
+      }
+      // Base64-encode the raw region so the JSON stays compact.
+      const pixelColorsB64 = btoa(
+        pixelChunks.reduce((s, b) => s + String.fromCharCode(b & 0xff), ""),
+      );
+
+      async function pagedFetch<T>(
+        total: bigint,
+        limit: number,
+        fetchChunk: (offset: bigint, limit: bigint) => Promise<T[]>,
+        label: string,
+      ): Promise<T[]> {
+        const out: T[] = [];
+        const totalN = Number(total);
+        for (let off = 0; off < totalN; off += limit) {
+          setMsg(`${label}: ${out.length}/${totalN}`);
+          const chunk = await fetchChunk(BigInt(off), BigInt(limit));
+          out.push(...chunk);
+          if (chunk.length < limit) break;
+        }
+        return out;
+      }
+
+      const [
+        pixels,
+        alliances,
+        user_alliance,
+        changes,
+        last_placed,
+        pixel_credits,
+        alliance_rounds,
+        mission_tile_index,
+        user_stats,
+        claimable_treasury,
+        pending_orders,
+      ] = await Promise.all([
+        pagedFetch(counts.pixels, 1000, actor.admin_export_pixels, "pixels"),
+        pagedFetch(counts.alliances, 100, actor.admin_export_alliances, "alliances"),
+        pagedFetch(counts.user_alliance, 1000, actor.admin_export_user_alliance, "user_alliance"),
+        pagedFetch(counts.changes, 1000, actor.admin_export_changes, "changes"),
+        pagedFetch(counts.last_placed, 1000, actor.admin_export_last_placed, "last_placed"),
+        pagedFetch(counts.pixel_credits, 1000, actor.admin_export_pixel_credits, "pixel_credits"),
+        pagedFetch(counts.alliance_rounds, 50, actor.admin_export_alliance_rounds, "alliance_rounds"),
+        pagedFetch(counts.mission_tile_index, 500, actor.admin_export_mission_tile_index, "mission_tile_index"),
+        pagedFetch(counts.user_stats, 500, actor.admin_export_user_stats, "user_stats"),
+        pagedFetch(counts.claimable_treasury, 1000, actor.admin_export_claimable_treasury, "claimable_treasury"),
+        pagedFetch(counts.pending_orders, 500, actor.admin_export_pending_orders, "pending_orders"),
+      ]);
+
+      setMsg("serializing JSON…");
+      const snapshot = {
+        schema_version: 1,
+        exported_at_ms: Date.now(),
+        counts,
+        singletons,
+        pixel_colors_base64: pixelColorsB64,
+        collections: {
+          pixels,
+          alliances,
+          user_alliance,
+          changes,
+          last_placed,
+          pixel_credits,
+          alliance_rounds,
+          mission_tile_index,
+          user_stats,
+          claimable_treasury,
+          pending_orders,
+        },
+      };
+
+      // BigInt isn't JSON-serializable by default — stringify via replacer.
+      const json = JSON.stringify(
+        snapshot,
+        (_k, v) => (typeof v === "bigint" ? v.toString() : v),
+        2,
+      );
+      const blob = new Blob([json], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      const ts = new Date().toISOString().replace(/[:.]/g, "-");
+      a.download = `icpixel-snapshot-${ts}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+
+      setMsg(`snapshot saved (${(blob.size / 1024).toFixed(1)} KB)`);
+    } catch (e) {
+      setMsg("snapshot failed: " + String(e));
+    } finally {
+      setExporting(false);
+    }
   }
+
 
   if (loading) return <div style={panelStyle}><p>Loading admin stats...</p></div>;
   if (!stats) return <div style={panelStyle}><p>Failed to load.</p><button onClick={onClose}>close</button></div>;
@@ -124,8 +235,7 @@ export default function AdminPanel({ actor, onClose }: Props) {
         <MetricCard label="NFTs Minted" value={fmt(stats.total_nfts_minted)} />
         <MetricCard label="Treasury" value={fmtIcp(stats.treasury_balance_e8s)} />
         <MetricCard label="Wallet Pending" value={fmtIcp(stats.wallet_pending_e8s)} />
-        <MetricCard label="ICP/USD" value={fmtUsdRate(stats.icp_usd_micro)} sub={fmtAge(stats.icp_usd_last_fetched_ns)} />
-        <MetricCard label="Pixel Price" value={stats.pixel_price_usd_cents === 0 ? "FREE" : `${stats.pixel_price_usd_cents}¢`} />
+        <MetricCard label="Pixel Price" value="Pack-based" />
         <MetricCard label="Cooldown" value={`${stats.pixel_cooldown_seconds}s`} />
         <MetricCard label="Status" value={stats.paused ? "PAUSED" : "LIVE"} warn={stats.paused} />
       </div>
@@ -146,7 +256,20 @@ export default function AdminPanel({ actor, onClose }: Props) {
         </div>
 
         <div style={actionRow}>
-          <button onClick={refreshPrice} style={btnPrimary}>Refresh ICP/USD</button>
+          <button
+            onClick={downloadSnapshot}
+            disabled={exporting}
+            style={{
+              ...btnPrimary,
+              background: exporting ? "#333" : "#7c3aed",
+              cursor: exporting ? "wait" : "pointer",
+            }}
+          >
+            {exporting ? "exporting…" : "⬇ Download full snapshot (JSON)"}
+          </button>
+          <span style={{ fontSize: 11, color: "#888" }}>
+            query-only · cheap
+          </span>
         </div>
       </div>
     </div>

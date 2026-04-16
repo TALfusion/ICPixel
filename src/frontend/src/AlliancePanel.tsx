@@ -44,6 +44,10 @@ interface Props {
   /// Receives the 0xRRGGBB color value. App.tsx uses this to select the
   /// nearest palette slot.
   onPickColor?: (color: number) => void;
+  /// Mobile layout flag — renders as bottom sheet instead of side panel.
+  isMobile?: boolean;
+  /// Close handler for mobile bottom sheet.
+  onClose?: () => void;
 }
 
 // ── Design tokens ──────────────────────────────────────────────────
@@ -624,6 +628,8 @@ export default function AlliancePanel({
   authed,
   requireSignIn,
   onPickColor,
+  isMobile,
+  onClose,
 }: Props) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -871,8 +877,50 @@ export default function AlliancePanel({
     Number(b.pixels_captured - a.pixels_captured)
   );
 
+  const mobilePanelStyle: CSSProperties = {
+    position: "fixed",
+    bottom: 0,
+    left: 0,
+    right: 0,
+    top: "auto",
+    width: "auto",
+    maxHeight: "70vh",
+    borderRadius: "16px 16px 0 0",
+    zIndex: 50,
+    background: C.bg,
+    border: `1px solid ${C.border}`,
+    borderBottom: "none",
+    fontSize: 13,
+    color: C.text,
+    display: "flex",
+    flexDirection: "column",
+    boxShadow: "0 -8px 32px rgba(0,0,0,0.5)",
+    fontFamily: "system-ui,sans-serif",
+    overscrollBehavior: "contain",
+  };
+
   return (
-    <div style={styles.panel}>
+    <>
+    {isMobile && onClose && (
+      <div
+        onClick={onClose}
+        style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.4)", zIndex: 49 }}
+      />
+    )}
+    <div style={isMobile ? mobilePanelStyle : styles.panel}>
+      {isMobile && (
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "center",
+            padding: "10px 0 6px",
+            cursor: "grab",
+          }}
+          onClick={onClose}
+        >
+          <div style={{ width: 40, height: 4, background: "#3a3a44", borderRadius: 2 }} />
+        </div>
+      )}
       <div style={styles.header}>
         <h3 style={styles.title}>⚔ Alliances</h3>
         <span style={{ fontSize: 11, color: C.textMuted }}>
@@ -1442,6 +1490,7 @@ export default function AlliancePanel({
        )}
       </div>
     </div>
+    </>
   );
 }
 

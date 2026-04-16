@@ -8,7 +8,7 @@ const SEASON_TAIL_DAYS = 4;
 const REFRESH_MS = 30_000;
 
 // ── Helpers ──────────────────────────────────────────────────────────
-import { fmtIcp, fmtUsd } from "./fmt";
+import { fmtIcp } from "./fmt";
 
 function stageIndex(mapSize: number): number {
   const idx = STAGES.indexOf(mapSize);
@@ -45,22 +45,19 @@ interface DashboardProps {
 export default function Dashboard({ actor, initialState, alliances, onPlay }: DashboardProps) {
   const [gs, setGs] = useState<GameState | null>(initialState);
   const [treasury, setTreasury] = useState<bigint>(0n);
-  const [icpRate, setIcpRate] = useState<bigint>(0n); // micro-USD per ICP
   const [lb, setLb] = useState<LeaderboardPage | null>(null);
   const [lastRefresh, setLastRefresh] = useState(0);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const refresh = useCallback(async () => {
     try {
-      const [g, t, price, board] = await Promise.all([
+      const [g, t, board] = await Promise.all([
         actor.get_game_state(),
         actor.get_treasury_balance(),
-        actor.get_icp_price(),
         actor.leaderboard(0n, 20n),
       ]);
       setGs(g);
       setTreasury(t);
-      setIcpRate(price.usd_per_icp_micro);
       setLb(board);
       setLastRefresh(Date.now());
     } catch (e) {
@@ -208,9 +205,6 @@ export default function Dashboard({ actor, initialState, alliances, onPlay }: Da
         <div className="dash-card">
           <div className="dash-card-label">SEASON TREASURY</div>
           <span className="dash-card-big">{fmtIcp(treasury)} ICP</span>
-          <span className="dash-card-dim" style={{ marginTop: 2 }}>
-            ≈ {fmtUsd(treasury, icpRate)} USD
-          </span>
           <span className="dash-card-dim" style={{ marginTop: 6, fontSize: 11 }}>
             Split among all NFT holders at season end
           </span>

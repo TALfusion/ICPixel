@@ -1,17 +1,16 @@
 import { useEffect, useRef, useState, useCallback, useMemo } from "react";
-import { Principal } from "@dfinity/principal";
 import {
   makeActor,
-  makeAgent,
   getAuthClient,
   loginWithII,
   logout,
   loadOrCreateIdentity,
   clearIdentity,
+  ensureReplicaFingerprint,
+  assertNetworkMatchesHost,
   useII,
 } from "./api";
-import type { Alliance, AlliancePublic, BackendActor, GameState, PlaceError } from "./idl";
-import { createLedgerActor, buildApproveAmount } from "./ledger";
+import type { Alliance, AlliancePublic, BackendActor, GameState, OrderCreated, OrderView, PlaceError } from "./idl";
 import AlliancePanel from "./AlliancePanel";
 import AdminPanel from "./AdminPanel";
 import Dashboard from "./Dashboard";
@@ -26,6 +25,35 @@ import {
   playMapGrew,
   playAllianceCreated,
 } from "./sound";
+import { useIsMobile } from "./useIsMobile";
+import { useTouchCanvas } from "./useTouchCanvas";
+
+// Translate raw backend error strings into short human-readable messages.
+// Prefers friendly phrasing over dumping the raw backend text at the user.
+// Returns `fallback` if nothing matches.
+function humanizeBackendError(raw: string, fallback = "Something went wrong — please try again"): string {
+  const s = raw.toLowerCase();
+  if (s.includes("anonymous") || s.includes("login required")) return "Please sign in first";
+  if (s.includes("unauthorized") || s.includes("only controllers")) return "Not allowed";
+  if (s.includes("ledger not configured")) return "Payments are not configured yet — please contact support";
+  if (s.includes("game is paused") || s.includes("paused")) return "The game is currently paused — try again later";
+  if (s.includes("unknown pack")) return "This pixel pack is not available";
+  if (s.includes("order not found") || s.includes("order disappeared")) return "This order no longer exists";
+  if (s.includes("already settled") || s.includes("already terminal")) return "This order was already completed";
+  if (s.includes("expired")) return "This order has expired";
+  if (s.includes("bad hex") || s.includes("expected 16 bytes")) return "Invalid order ID";
+  if (s.includes("nothing to rescue")) return "Nothing to rescue — the deposit address is empty";
+  if (s.includes("insufficientfunds")) return "Insufficient ICP balance";
+  if (s.includes("insufficientallowance")) return "Insufficient allowance";
+  if (s.includes("temporarilyunavailable")) return "ICP ledger is temporarily unavailable — try again in a moment";
+  if (s.includes("badfee")) return "Ledger fee changed — please retry";
+  if (s.includes("too old") || s.includes("tooold")) return "Request timed out — please retry";
+  if (s.includes("raw_rand")) return "Could not generate a secure order ID — please retry";
+  if (s.includes("does not cover ledger fee")) return "Received amount is too small to cover the network fee";
+  if (s.includes("icrc1_transfer") || s.includes("icrc1_balance_of")) return "ICP ledger call failed — please retry";
+  if (s.includes("icrc2_transfer_from") || s.includes("transfer_from rejected")) return "Payment transfer failed";
+  return fallback;
+}
 
 // Map growth stages (mirrors STAGES in src/backend/src/map.rs).
 // When `unique_pixels_set` reaches `map_size²`, map grows to the next stage.
@@ -160,6 +188,7 @@ const blockedCursorUrl: string = (() => {
 })();
 
 export default function App() {
+  const isMobile = useIsMobile();
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wrapperRef = useRef<HTMLDivElement>(null);
 
@@ -279,6 +308,7 @@ export default function App() {
   const [panelOpen, setPanelOpen] = useState(false);
   const [panelTab, setPanelTab] = useState<"mine" | "leaderboard">("mine");
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [showFullPrincipal, setShowFullPrincipal] = useState(false);
 
   // Pan clamp.
@@ -378,25 +408,45 @@ export default function App() {
   const onCooldown = cooldownRemaining > 0;
 
   // ── Pixel credits / pixel-pack shop ───────────────────────────────
-  // In free mode (`pixel_price_usd_cents == 0` on the backend) buy_pixels
-  // credits immediately without any ledger interaction. Once flipped to
-  // paid mode the same UI will trigger an ICRC-2 transfer_from path on
-  // the backend — no client changes needed.
+  // Paid mode via deposit orders: user clicks a pack → backend creates a
+  // unique subaccount deposit address with an expected amount → user sends
+  // ICP from any wallet → backend polls the subaccount and credits pixels
+  // once funds arrive within the tolerance window.
   const [pixelCredits, setPixelCredits] = useState<bigint>(0n);
   const [shopOpen, setShopOpen] = useState(false);
-  // Cached ICP/USD rate for shop display. Fetched from backend on mount.
-  const [usdPerIcp, setUsdPerIcp] = useState(0);
   const [helpOpen, setHelpOpen] = useState(false);
   const [howToPlay, setHowToPlay] = useState(false);
   const [showPrivacy, setShowPrivacy] = useState(false);
   const [showTerms, setShowTerms] = useState(false);
   const [shopBusy, setShopBusy] = useState(false);
-  // Two-step pack flow: (1) click a pack → stash the count in
-  // `shopDepositPack` and switch the modal to the deposit view;
-  // (2) user sends ICP to the shown address and clicks "I paid" →
-  // backend credits the pack (currently free-mode, but the flow is
-  // already wired so flipping to real ICRC-2 later changes backend only).
-  const [shopDepositPack, setShopDepositPack] = useState<number | null>(null);
+  // Two-step pack flow: (1) click a pack → stash it in shopDepositPack;
+  // (2) confirm view shows the ICP price and triggers create_order.
+  const [shopDepositPack, setShopDepositPack] = useState<{ id: number; count: number; icp: string } | null>(null);
+  // Active deposit order being tracked — once set, OrderModal renders
+  // deposit addresses + QR + live timer + polling.
+  const [activeOrder, setActiveOrder] = useState<OrderCreated | null>(null);
+  const [orderView, setOrderView] = useState<OrderView | null>(null);
+  // Last non-fatal polling error message (e.g. ledger temporarily down).
+  // Displayed under the status line in OrderModal; cleared on next good poll.
+  const [orderError, setOrderError] = useState<string | null>(null);
+  // Shop-specific error surfaced in the confirm view before the order is
+  // created. Kept separate from global `status` so unrelated status
+  // messages (cooldown, "ready", etc) don't leak into the shop modal.
+  const [shopError, setShopError] = useState<string | null>(null);
+  // Wallet format the buyer chose before generating the deposit address.
+  // Drives which format OrderModal displays (simpler one-address UI per
+  // wallet type, instead of showing all three). Persisted in localStorage
+  // so returning users don't re-pick each purchase.
+  type WalletType = "account_id" | "icrc1";
+  const [walletType, setWalletTypeState] = useState<WalletType>(() => {
+    const saved = typeof window !== "undefined" ? localStorage.getItem("icpixel.walletType") : null;
+    return saved === "icrc1" ? "icrc1" : "account_id";
+  });
+  const setWalletType = useCallback((t: WalletType) => {
+    setWalletTypeState(t);
+    try { localStorage.setItem("icpixel.walletType", t); } catch {}
+  }, []);
+
   const refreshCredits = useCallback(async () => {
     if (!actor) return;
     try {
@@ -410,83 +460,80 @@ export default function App() {
     refreshCredits();
   }, [refreshCredits]);
 
-  async function handleBuyPixels(count: number) {
-    if (!actor || shopBusy) return;
-    // View-only gate. After sign-in, replay the same purchase automatically.
-    if (!authed) {
-      requireSignIn("Sign in to buy pixel credits", () => handleBuyPixels(count));
-      return;
-    }
-    setShopBusy(true);
-    try {
-      // Fetch the live billing config to decide whether this is a free or
-      // paid purchase. Checking right before the call (instead of caching)
-      // means the UI always acts on the latest admin config and we don't
-      // accidentally bypass payment after a price flip.
-      const billing = await actor.get_alliance_billing();
-      const priceCents = Number(billing.pixel_price_usd_cents ?? 0);
-      const ledgerPrincipal: Principal | null =
-        billing.ledger.length > 0 && billing.ledger[0]
-          ? billing.ledger[0]
-          : null;
-      const paid = priceCents > 0 && ledgerPrincipal !== null;
-
-      if (paid && ledgerPrincipal) {
-        // Compute an approve amount the browser can commit to. The backend
-        // will re-derive the exact e8s from its own cached ICP/USD rate,
-        // so our number only has to be a safe upper bound (base + 10%
-        // buffer + ledger fee — see buildApproveAmount).
-        if (usdPerIcp <= 0) {
-          throw new Error(
-            "ICP/USD rate not yet loaded — wait a few seconds and try again",
-          );
-        }
-        const usdTotal = (count * priceCents) / 100; // dollars
-        const icpTotal = usdTotal / usdPerIcp;
-        const e8sPerPixel = BigInt(
-          Math.ceil(((priceCents / 100) / usdPerIcp) * 1e8),
-        );
-        const approveAmount = buildApproveAmount(BigInt(count), e8sPerPixel);
-
-        setStatus(`approving ${icpTotal.toFixed(4)} ICP…`);
-        const identity = (await getAuthClient()).getIdentity();
-        const agent = await makeAgent(identity);
-        const ledgerActor = createLedgerActor(agent, ledgerPrincipal.toString());
-        const backendIdStr = import.meta.env.VITE_BACKEND_CANISTER_ID as string;
-        const approveRes = await ledgerActor.icrc2_approve({
-          from_subaccount: [],
-          spender: {
-            owner: Principal.fromText(backendIdStr),
-            subaccount: [],
-          },
-          amount: approveAmount,
-          expected_allowance: [],
-          expires_at: [],
-          fee: [],
-          memo: [],
-          created_at_time: [],
-        });
-        if ("Err" in approveRes) {
-          setStatus("approve failed: " + JSON.stringify(approveRes.Err));
+  // Poll an active order every 10s until it reaches a terminal state.
+  useEffect(() => {
+    if (!actor || !activeOrder) return;
+    let cancelled = false;
+    const tick = async () => {
+      if (!actor || !activeOrder) return;
+      try {
+        const res = await actor.check_order(activeOrder.order_id_hex);
+        if (cancelled) return;
+        if ("Err" in res) {
+          console.warn("check_order failed", res.Err);
+          setOrderError(humanizeBackendError(res.Err as string, "Could not check order status — retrying…"));
           return;
         }
-        setStatus("charging…");
+        // Clear any stale error from previous poll.
+        setOrderError(null);
+        setOrderView(res.Ok);
+        // Paid — refresh credits, close modal after a short success dwell.
+        if ("Paid" in res.Ok.status) {
+          await refreshCredits();
+          setTimeout(() => {
+            if (cancelled) return;
+            setActiveOrder(null);
+            setOrderView(null);
+            setShopOpen(false);
+            setShopDepositPack(null);
+          }, 3000);
+        }
+      } catch (e) {
+        console.warn("check_order threw", e);
+        setOrderError("Connection issue — retrying in 10s…");
       }
+    };
+    // Kick off immediately so the first poll doesn't wait 10s.
+    tick();
+    const id = setInterval(tick, 10_000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [actor, activeOrder, refreshCredits]);
 
-      const res = await actor.buy_pixels(BigInt(count));
+  async function handleBuyPack(packId: number, packIcp: string, packPixels: number) {
+    if (!actor || shopBusy) return;
+    if (!authed) {
+      requireSignIn("Sign in to buy pixel credits", () => handleBuyPack(packId, packIcp, packPixels));
+      return;
+    }
+    void packIcp;
+    void packPixels;
+    setShopBusy(true);
+    setShopError(null);
+    try {
+      const res = await actor.create_order(packId);
       if ("Err" in res) {
-        setStatus("buy_pixels: " + res.Err);
-      } else {
-        setStatus(`+${count} pixels`);
-        await refreshCredits();
-        setShopOpen(false);
-        setShopDepositPack(null);
+        setShopError(humanizeBackendError(res.Err as string, "Could not create order — please try again"));
+        return;
       }
+      setActiveOrder(res.Ok);
+      setOrderView(null);
+      setOrderError(null);
+      setShopError(null);
     } catch (e) {
-      setStatus("buy_pixels error: " + String(e));
+      console.warn("create_order threw", e);
+      setShopError("Connection issue — please check your internet and try again");
     } finally {
       setShopBusy(false);
     }
+  }
+
+  function closeActiveOrder() {
+    setActiveOrder(null);
+    setOrderView(null);
+    setOrderError(null);
   }
 
   // ── Mission template overlay ──────────────────────────────────────
@@ -580,6 +627,14 @@ export default function App() {
   useEffect(() => {
     (async () => {
       try {
+        // First gate: fail loudly if the bundle was built for a different
+        // network than the host we're served from (prevents local writes
+        // going to mainnet and vice versa).
+        assertNetworkMatchesHost();
+        // Detect a local replica reset (new root key) and wipe stale
+        // identity/delegation so the user never hits "Invalid signature".
+        // No-op on mainnet.
+        await ensureReplicaFingerprint();
         if (useII) {
           // Mainnet or local-with-II-canister: respect an existing II
           // session, otherwise start anonymous (view-only). Never auto-
@@ -594,9 +649,6 @@ export default function App() {
           setActor(a);
           await refreshAll(a);
           a.am_i_controller().then(setIsController).catch(() => {});
-          a.get_icp_price().then((p: { usd_per_icp_micro: bigint }) => {
-            if (p.usd_per_icp_micro > 0n) setUsdPerIcp(Number(p.usd_per_icp_micro) / 1_000_000);
-          }).catch(() => {});
           setStatus(isAuthed ? "ready" : "ready (read-only — sign in to play)");
         } else {
           // Local dev: auto-hydrate (or generate on first run) a persistent
@@ -612,9 +664,31 @@ export default function App() {
           a.am_i_controller().then(setIsController).catch(() => {});
           setStatus("ready (local dev identity)");
         }
+        sessionStorage.removeItem("icpixel_auth_recovered");
       } catch (e) {
         console.error(e);
-        setStatus("error: " + String(e));
+        // Auto-recover from stale identity/delegation after a local
+        // replica reset: wipe everything and reload once.
+        const msg = String(e);
+        const looksLikeSignatureFail =
+          msg.includes("Invalid signature") ||
+          msg.includes("could not be verified") ||
+          msg.includes("delegation") ||
+          msg.includes("certificate verification failed");
+        const alreadyTried = sessionStorage.getItem("icpixel_auth_recovered") === "1";
+        if (looksLikeSignatureFail && !alreadyTried) {
+          try {
+            clearIdentity();
+            Object.keys(localStorage)
+              .filter((k) => k.startsWith("ic-") || k.includes("delegation") || k.includes("identity"))
+              .forEach((k) => localStorage.removeItem(k));
+          } catch {}
+          try { indexedDB.deleteDatabase("auth-client-db"); } catch {}
+          sessionStorage.setItem("icpixel_auth_recovered", "1");
+          location.reload();
+          return;
+        }
+        setStatus("error: " + msg);
       }
     })();
   }, []);
@@ -1138,6 +1212,13 @@ export default function App() {
     };
   }, [displayMap, state, replayActiveSize]);
 
+  // ── Growing cinematic state (hoisted for touch hook) ─────────────
+  const [growing, setGrowing] = useState(false);
+  const growingRef = useRef(false);
+  useEffect(() => {
+    growingRef.current = growing;
+  }, [growing]);
+
   // ── Resize handling ───────────────────────────────────────────────
   const [baseSize, setBaseSize] = useState(800);
   useEffect(() => {
@@ -1220,20 +1301,23 @@ export default function App() {
     };
   }
 
-  /// Strict version: returns null if the cursor is outside the map.
-  function pixelFromEvent(e: React.MouseEvent): { x: number; y: number } | null {
+  /// Strict version: returns null if the point is outside the map.
+  function pixelFromPoint(clientX: number, clientY: number): { x: number; y: number } | null {
     const canvas = canvasRef.current;
     if (!canvas || !state) return null;
     const rect = canvas.getBoundingClientRect();
     const size = state.map_size;
     const cellPx = rect.width / size;
-    const rawX = Math.floor((e.clientX - rect.left) / cellPx);
-    const rawY = Math.floor((e.clientY - rect.top) / cellPx);
+    const rawX = Math.floor((clientX - rect.left) / cellPx);
+    const rawY = Math.floor((clientY - rect.top) / cellPx);
     const hn = halfNeg(size);
     const x = rawX - hn;
     const y = rawY - hn;
     if (!inBounds(x, y, size)) return null;
     return { x, y };
+  }
+  function pixelFromEvent(e: React.MouseEvent): { x: number; y: number } | null {
+    return pixelFromPoint(e.clientX, e.clientY);
   }
 
   useEffect(() => () => {
@@ -1636,10 +1720,54 @@ export default function App() {
 
   const renderSize = baseSize * zoom;
 
+  // ── Touch gestures (mobile only) ───────────────────────────────────
+  const clampPanCb = useCallback(
+    (p: { x: number; y: number }, rs: number) => clampPan(p, rs),
+    [],
+  );
+  function handleTouchTap(clientX: number, clientY: number) {
+    if (!actor || !state || !map) return;
+    if (!authed) {
+      requireSignIn("Sign in to place pixels", () => {});
+      return;
+    }
+    unlockAudio();
+    if (Date.now() < cooldownUntilRef.current) {
+      playError();
+      shake();
+      const sec = Math.ceil((cooldownUntilRef.current - Date.now()) / 1000);
+      setStatus(`cooldown: ${sec}s`);
+      return;
+    }
+    const p = pixelFromPoint(clientX, clientY);
+    if (!p) return;
+    const color = palette[selectedSlot];
+    const idx = cellToIdx(p.x, p.y, state.map_size);
+    const prev = map[idx];
+    if (prev === color && !skipSameColorWarn) {
+      setSameColorConfirm({ x: p.x, y: p.y, color });
+      return;
+    }
+    spawnClickRipple(clientX, clientY, color);
+    doPlacePixel(p.x, p.y, color);
+  }
+  useTouchCanvas({
+    wrapperRef: wrapperRef as React.RefObject<HTMLDivElement>,
+    enabled: isMobile,
+    zoom,
+    pan,
+    setZoom,
+    setPan,
+    baseSize,
+    clampPan: clampPanCb,
+    onTap: handleTouchTap,
+    growingRef: growingRef as React.RefObject<boolean>,
+  });
+
   // ── Mini-map ──────────────────────────────────────────────────────
   // Throttled to ~10 FPS: downsampling a 1000×1000 map on every poll tick
   // is wasted work — at 180px the user can't perceive sub-100ms updates.
-  const MINI_SIZE = 180;
+  const MINI_SIZE = isMobile ? 70 : 180;
   const miniRef = useRef<HTMLCanvasElement>(null);
   const miniImageDataRef = useRef<ImageData | null>(null);
   const miniLastRenderRef = useRef<number>(0);
@@ -1893,11 +2021,6 @@ export default function App() {
   // hold for ~1.5s, then restore the previous pan/zoom. Animated via CSS
   // transition on the canvas (see `growing` below).
   const prevMapSizeRef = useRef<number | null>(null);
-  const [growing, setGrowing] = useState(false);
-  const growingRef = useRef(false);
-  useEffect(() => {
-    growingRef.current = growing;
-  }, [growing]);
   useEffect(() => {
     if (!state) return;
     const prev = prevMapSizeRef.current;
@@ -2015,7 +2138,7 @@ export default function App() {
       }}>
         <img
           src="/img/logo.svg"
-          alt="ICPixel"
+          alt=""
           style={{
             width: 120,
             height: 120,
@@ -2023,17 +2146,9 @@ export default function App() {
           }}
         />
         <div style={{
-          fontSize: 24,
-          fontWeight: 800,
-          color: "#e8e8ec",
-          letterSpacing: 1,
-          fontFamily: "system-ui,sans-serif",
-        }}>
-          ICPixel
-        </div>
-        <div style={{
           fontSize: 13,
           color: "#60606a",
+          marginTop: 16,
         }}>
           {status}
         </div>
@@ -2138,7 +2253,47 @@ export default function App() {
       )}
 
       {/* ── Unified nav bar ── */}
-      <div className="nav-bar">
+      {isMobile ? (
+        /* ── Mobile: minimal top bar ── */
+        <div className="nav-bar nav-bar--mobile">
+          <span className="nav-brand">
+            <img src="/img/logo.svg" alt="" style={{ width: 16, height: 16, marginRight: 5, verticalAlign: -2 }} />
+            ICPixel
+          </span>
+          <span className="nav-spacer" />
+          {screen === "game" && !replayMode && (
+            <button
+              onClick={() => setShopOpen(true)}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 5,
+                padding: "3px 8px",
+                background: "#1a1a20",
+                border: "1px solid #2a2a32",
+                borderRadius: 999,
+                fontSize: 11,
+                fontWeight: 600,
+                color: "#e8e8ec",
+                fontVariantNumeric: "tabular-nums",
+                fontFamily: "inherit",
+                cursor: "pointer",
+              }}
+            >
+              <span>{String(pixelCredits)}</span>
+              <span style={{ opacity: 0.55, fontWeight: 500, fontSize: 10 }}>PX</span>
+              <span style={{ fontSize: 12, lineHeight: 1, opacity: 0.7 }}>+</span>
+            </button>
+          )}
+          {screen !== "game" && (
+            <button className="btn" style={{ padding: "4px 10px", fontSize: 11 }} onClick={() => setScreen("game")}>
+              Play
+            </button>
+          )}
+        </div>
+      ) : (
+        /* ── Desktop: full nav bar ── */
+        <div className="nav-bar">
         <span className="nav-brand">
           <img src="/img/logo.svg" alt="" style={{ width: 18, height: 18, marginRight: 6, verticalAlign: -3 }} />
           ICPixel
@@ -2152,8 +2307,6 @@ export default function App() {
             {s === "game" ? "Play" : s === "dashboard" ? "Dashboard" : "Admin"}
           </button>
         ))}
-
-        {/* Map progress pill removed — info lives in Dashboard now */}
 
         {/* Pixel credits — centered */}
         {screen === "game" && !replayMode && (
@@ -2304,6 +2457,7 @@ export default function App() {
           )}
         </div>
       </div>
+      )}
 
       {/* ── Dashboard screen ── */}
       {screen === "dashboard" && actor && (
@@ -2341,6 +2495,7 @@ export default function App() {
           overflow: "hidden",
           background: "#222",
           cursor: dragRef.current ? "grabbing" : "default",
+          ...(isMobile ? { touchAction: "none" } : {}),
         }}
       >
         <canvas
@@ -2505,7 +2660,7 @@ export default function App() {
             return overlays;
           })()}
 
-        {hover && state && (
+        {hover && state && !isMobile && (
           <div
             key={`hover-${shakeKey}`}
             className={shakeKey > 0 ? "hover-shake" : undefined}
@@ -2542,10 +2697,10 @@ export default function App() {
             data-tip-pos="top"
             style={{
               position: "absolute",
-              right: panelOpen ? 14 + 340 + 12 : 14,
+              right: isMobile ? 14 : panelOpen ? 14 + 340 + 12 : 14,
               bottom: 14,
               transition: "right 0.18s ease",
-              fontSize: 16,
+              fontSize: isMobile ? 13 : 16,
               fontWeight: 800,
               padding: "8px 16px",
               borderRadius: 8,
@@ -2603,8 +2758,9 @@ export default function App() {
                 border: "1px solid #2a2a32",
                 borderRadius: 10,
                 padding: 24,
-                minWidth: 340,
+                minWidth: isMobile ? 0 : 340,
                 maxWidth: 420,
+                width: isMobile ? "90vw" : undefined,
                 color: "#e8e8ec",
                 boxShadow: "0 20px 60px rgba(0,0,0,0.6)",
               }}
@@ -2623,20 +2779,19 @@ export default function App() {
                     Pixel Pack
                   </div>
                   <div style={{ fontSize: 12, color: "#9090a0", marginBottom: 16 }}>
-                    Buy pixel credits. Each credit = 1 pixel. Currently free
-                    — the deposit address below is for the live-mode preview.
+                    Buy pixel credits. Each credit = 1 pixel.
                   </div>
                   {([
-                    { count: 10, icp: "0.001" },
-                    { count: 100, icp: "2" },
-                    { count: 500, icp: "5" },
-                    { count: 1000, icp: "8" },
-                  ] as const).map(({ count: n, icp }) => (
+                    { id: 0, count: 10, icp: "0.001" },
+                    { id: 1, count: 100, icp: "2" },
+                    { id: 2, count: 500, icp: "5" },
+                    { id: 3, count: 1000, icp: "8" },
+                  ] as const).map(({ id, count: n, icp }) => (
                       <button
                         key={n}
                         disabled={shopBusy}
                         onClick={() => {
-                          setShopDepositPack(n);
+                          setShopDepositPack({ id, count: n, icp });
                                           }}
                         style={{
                           display: "flex",
@@ -2688,7 +2843,7 @@ export default function App() {
                   </button>
                 </>
               ) : (
-                // ── Confirm + pay view (ICRC-2 approve flow) ──────
+                // ── Confirm view → generate deposit order ─────────
                 (() => {
                   return (
                     <>
@@ -2700,32 +2855,71 @@ export default function App() {
                           color: "#e8e8ec",
                         }}
                       >
-                        Buy {shopDepositPack.toLocaleString()} pixels
+                        Buy {shopDepositPack.count.toLocaleString()} pixels
                       </div>
                       <div
                         style={{
                           fontSize: 12,
                           color: "#9090a0",
-                          marginBottom: 16,
+                          marginBottom: 14,
                         }}
                       >
-                        {usdPerIcp > 0 ? (
-                          <>
-                            You will approve{" "}
-                            <span style={{ color: "#f0c040", fontWeight: 700 }}>
-                              ~{((shopDepositPack * 0.05) / usdPerIcp * 1.1).toFixed(4)} ICP
-                            </span>{" "}
-                            from your wallet. The exact amount is calculated from the
-                            live ICP/USD rate (${usdPerIcp.toFixed(2)}/ICP) + 10% buffer.
-                          </>
-                        ) : (
-                          "Loading ICP rate..."
-                        )}
+                        Price:{" "}
+                        <span style={{ color: "#f0c040", fontWeight: 700 }}>
+                          {shopDepositPack.icp} ICP
+                        </span>
+                        . Pick your wallet type below to get the right address format.
                       </div>
 
+                      <div style={{ fontSize: 11, color: "#6a6a76", marginBottom: 4, fontWeight: 600 }}>
+                        WHICH WALLET ARE YOU USING?
+                      </div>
+                      <select
+                        value={walletType}
+                        onChange={(e) => setWalletType(e.target.value as "account_id" | "icrc1")}
+                        disabled={shopBusy}
+                        style={{
+                          width: "100%",
+                          padding: "10px 12px",
+                          marginBottom: 14,
+                          background: "#1f1f25",
+                          color: "#e8e8ec",
+                          border: "1px solid #2a2a32",
+                          borderRadius: 6,
+                          fontSize: 13,
+                          cursor: shopBusy ? "wait" : "pointer",
+                          appearance: "none",
+                          WebkitAppearance: "none",
+                          backgroundImage:
+                            "url(\"data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'><path fill='%239090a0' d='M6 8L0 0h12z'/></svg>\")",
+                          backgroundRepeat: "no-repeat",
+                          backgroundPosition: "right 12px center",
+                          paddingRight: 34,
+                        }}
+                      >
+                        <option value="account_id">NNS • Coinbase • Binance • Kraken • exchanges</option>
+                        <option value="icrc1">Plug • Oisy • NFID • ICRC-1 wallets</option>
+                      </select>
+
+                      {shopError && !shopBusy && (
+                        <div
+                          style={{
+                            fontSize: 12,
+                            color: "#ff8080",
+                            marginBottom: 12,
+                            padding: "8px 10px",
+                            background: "rgba(255,80,80,0.08)",
+                            border: "1px solid rgba(255,80,80,0.3)",
+                            borderRadius: 6,
+                          }}
+                        >
+                          {shopError}
+                        </div>
+                      )}
+
                       <button
-                        disabled={shopBusy || usdPerIcp <= 0}
-                        onClick={() => handleBuyPixels(shopDepositPack)}
+                        disabled={shopBusy}
+                        onClick={() => handleBuyPack(shopDepositPack.id, shopDepositPack.icp, shopDepositPack.count)}
                         style={{
                           display: "block",
                           width: "100%",
@@ -2740,12 +2934,13 @@ export default function App() {
                           cursor: shopBusy ? "wait" : "pointer",
                         }}
                       >
-                        {shopBusy ? status || "processing…" : "Approve & Buy"}
+                        {shopBusy ? "generating…" : "Generate payment address"}
                       </button>
 
                       <button
                         onClick={() => {
                           setShopDepositPack(null);
+                          setShopError(null);
                         }}
                         disabled={shopBusy}
                         style={{
@@ -2768,6 +2963,21 @@ export default function App() {
               )}
             </div>
           </div>
+        )}
+
+        {/* Deposit-order modal: renders once `activeOrder` is set by
+            handleBuyPack → create_order. Polls check_order every 10s to
+            detect payment. Closes itself on Paid (after a 3s success dwell)
+            or on manual close / Expired. */}
+        {activeOrder && (
+          <OrderModal
+            order={activeOrder}
+            view={orderView}
+            error={orderError}
+            walletType={walletType}
+            onClose={closeActiveOrder}
+            isMobile={isMobile}
+          />
         )}
 
         {/* View-only → sign-in prompt. Opened by `requireSignIn` from any
@@ -2904,8 +3114,8 @@ export default function App() {
           </div>
         )}
 
-        {/* Hint overlay when creating */}
-        {creatingAlliance && (
+        {/* Hint overlay when creating (desktop only — no shift key on mobile) */}
+        {creatingAlliance && !isMobile && (
           <div
             style={{
               position: "absolute",
@@ -2925,11 +3135,156 @@ export default function App() {
               : "hold SHIFT and drag on the map to draw mission area"}
           </div>
         )}
+
+        {/* ── Mobile collapsible left menu ── */}
+        {isMobile && screen === "game" && !replayMode && (
+          <>
+            {/* Hamburger toggle — always visible, top-left */}
+            <button
+              onClick={() => setMobileMenuOpen((v) => !v)}
+              aria-label="menu"
+              style={{
+                position: "absolute",
+                left: 8,
+                top: 8,
+                width: 36,
+                height: 36,
+                borderRadius: 8,
+                border: "1px solid #2a2a32",
+                background: mobileMenuOpen ? "#2a2a32" : "rgba(17,17,21,0.85)",
+                color: "#e8e8ec",
+                cursor: "pointer",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                padding: 0,
+                zIndex: 12,
+                backdropFilter: "blur(4px)",
+              }}
+            >
+              <span style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                <span style={{ width: 16, height: 2, background: "#e8e8ec", borderRadius: 1 }} />
+                <span style={{ width: 16, height: 2, background: "#e8e8ec", borderRadius: 1 }} />
+                <span style={{ width: 16, height: 2, background: "#e8e8ec", borderRadius: 1 }} />
+              </span>
+            </button>
+
+            {/* Expanded side panel */}
+            {mobileMenuOpen && (
+              <>
+                <div
+                  onClick={() => setMobileMenuOpen(false)}
+                  style={{ position: "absolute", inset: 0, zIndex: 9, background: "rgba(0,0,0,0.35)" }}
+                />
+                <div
+                  style={{
+                    position: "absolute",
+                    left: 0,
+                    top: 0,
+                    bottom: 0,
+                    width: 180,
+                    background: "#0f0f13",
+                    borderRight: "1px solid #2a2a32",
+                    padding: "52px 8px 12px 8px",
+                    zIndex: 11,
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: 4,
+                    boxShadow: "4px 0 20px rgba(0,0,0,0.6)",
+                  }}
+                >
+                  {([
+                    { label: "dashboard", action: () => { setScreen("dashboard"); setMobileMenuOpen(false); }, active: false },
+                    { label: "replay", action: () => { enterReplay(); setMobileMenuOpen(false); }, active: false },
+                    { label: "alliances", action: () => { setPanelOpen((v) => !v); setMobileMenuOpen(false); }, active: panelOpen },
+                    { label: "settings", action: () => setSettingsOpen((v) => !v), active: settingsOpen },
+                  ] as const).map(({ label, action, active }) => (
+                    <button
+                      key={label}
+                      onClick={action}
+                      style={{
+                        width: "100%",
+                        textAlign: "left",
+                        padding: "10px 12px",
+                        borderRadius: 6,
+                        border: "none",
+                        background: active ? "#2a2a32" : "transparent",
+                        color: "#e8e8ec",
+                        fontSize: 13,
+                        fontFamily: "inherit",
+                        cursor: "pointer",
+                      }}
+                    >
+                      {label}
+                    </button>
+                  ))}
+
+                  {/* Settings inline panel */}
+                  {settingsOpen && (
+                    <div
+                      style={{
+                        marginTop: 4,
+                        background: "#1a1a20",
+                        border: "1px solid #2a2a32",
+                        borderRadius: 8,
+                        padding: 10,
+                        display: "flex",
+                        flexDirection: "column",
+                        gap: 10,
+                      }}
+                    >
+                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+                        <span style={{ fontSize: 11, color: "#9090a0" }}>sound</span>
+                        <button
+                          className="btn"
+                          onClick={() => {
+                            unlockAudio();
+                            const next = !muted;
+                            setMuted(next);
+                            setMutedState(next);
+                          }}
+                        >
+                          {muted ? "off" : "on"}
+                        </button>
+                      </div>
+                      {authed && principal ? (
+                        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                          <span style={{ fontSize: 11, color: "#9090a0" }}>identity</span>
+                          <span
+                            style={{
+                              fontSize: 10,
+                              color: "#e8e8ec",
+                              fontFamily: "ui-monospace, SFMono-Regular, monospace",
+                              wordBreak: "break-all",
+                              cursor: "pointer",
+                              userSelect: "all",
+                            }}
+                            onClick={handlePrincipalClick}
+                          >
+                            {showFullPrincipal
+                              ? principal
+                              : `${principal.slice(0, 10)}…${principal.slice(-5)}`}
+                          </span>
+                          {useII ? (
+                            <button className="btn" onClick={handleLogout}>sign out</button>
+                          ) : (
+                            <button className="btn" onClick={resetIdentity}>new id</button>
+                          )}
+                        </div>
+                      ) : (
+                        <button className="btn primary" onClick={handleLogin}>sign in</button>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </>
+            )}
+          </>
+        )}
       </div>
 
-      {actor && state && !replayMode && panelOpen && (
+      {actor && state && !replayMode && panelOpen && !isMobile && (
         <div style={{ display: "flex", flexDirection: "column", borderLeft: "1px solid #2a2a32" }}>
-          {(
         <AlliancePanel
           actor={actor}
           alliances={alliances}
@@ -2964,7 +3319,6 @@ export default function App() {
             setSelectedSlot(best);
           }}
         />
-          )}
         </div>
       )}
 
@@ -3103,17 +3457,18 @@ export default function App() {
       {!replayMode && (
       <div
         style={{
-          padding: "10px 14px",
+          padding: isMobile ? "6px 4px" : "10px 14px",
           borderTop: "1px solid #333",
           display: "flex",
           justifyContent: "center",
           alignItems: "center",
-          gap: 6,
+          gap: isMobile ? 3 : 6,
           flexWrap: "wrap",
           position: "relative",
         }}
       >
-        {/* Help button */}
+        {/* Help button (desktop only) */}
+        {!isMobile && (
         <button
           onClick={() => setHelpOpen(true)}
           style={{
@@ -3139,7 +3494,9 @@ export default function App() {
         >
           ?
         </button>
-        {/* Cursor coordinates — visible when hovering the map. */}
+        )}
+        {/* Cursor coordinates — visible when hovering the map (desktop only). */}
+        {!isMobile && (
         <div
           style={{
             position: "absolute",
@@ -3155,6 +3512,7 @@ export default function App() {
         >
           {hover ? `(${hover.x}, ${-hover.y})` : "(—, —)"}
         </div>
+        )}
         {palette.map((c, i) => {
           // Find the digit (if any) bound to this slot — shown as a small label.
           const digit = Object.entries(bindings).find(([, s]) => s === i)?.[0]
@@ -3170,8 +3528,8 @@ export default function App() {
               }
               style={{
                 position: "relative",
-                width: 30,
-                height: 30,
+                width: isMobile ? 22 : 30,
+                height: isMobile ? 22 : 30,
                 background: intToHex(c),
                 border:
                   i === selectedSlot
@@ -3186,7 +3544,7 @@ export default function App() {
                 zIndex: i === selectedSlot ? 2 : 1,
               }}
             >
-              {digit && (
+              {digit && !isMobile && (
                 <span
                   style={{
                     position: "absolute",
@@ -3209,8 +3567,8 @@ export default function App() {
             </button>
           );
         })}
-        {/* Eyedropper toggle */}
-        <div
+        {/* Eyedropper toggle (desktop only) */}
+        {!isMobile && <div
           style={{ position: "relative", marginLeft: 4, flexShrink: 0 }}
           onMouseEnter={(e) => { e.currentTarget.querySelector<HTMLElement>("[data-tip]")!.style.opacity = "1"; }}
           onMouseLeave={(e) => { e.currentTarget.querySelector<HTMLElement>("[data-tip]")!.style.opacity = "0"; }}
@@ -3218,8 +3576,8 @@ export default function App() {
           <button
             onClick={() => setEyedropperMode((v) => !v)}
             style={{
-              width: 30,
-              height: 30,
+              width: isMobile ? 26 : 30,
+              height: isMobile ? 26 : 30,
               background: "#2a2a32",
               border: "1px solid #555",
               borderRadius: 4,
@@ -3265,10 +3623,50 @@ export default function App() {
             <div>pick color from map or <span style={{ color: "#f0c040" }}>mission preview</span></div>
             <div>shortcut: hold <span style={{ color: "#f0c040", fontWeight: 700 }}>Tab</span></div>
           </div>
-        </div>
+        </div>}
       </div>
       )}
       </div>
+
+      {/* Mobile alliance bottom sheet — rendered outside game flex for fixed positioning */}
+      {actor && state && !replayMode && panelOpen && isMobile && (
+        <AlliancePanel
+          actor={actor}
+          alliances={alliances}
+          myAlliance={myAlliance}
+          myPrincipal={principal}
+          pendingRect={pendingRect}
+          creating={creatingAlliance}
+          mapSize={state.map_size}
+          setCreating={setCreatingAlliance}
+          setPendingRect={setPendingRect}
+          onClearRect={() => setPendingRect(null)}
+          onChanged={() => refreshMeta(actor)}
+          missionProgress={missionProgress}
+          onGoToMission={goToMission}
+          onShareMission={shareMyAlliance}
+          tab={panelTab}
+          setTab={setPanelTab}
+          authed={authed}
+          requireSignIn={requireSignIn}
+          onPickColor={(color) => {
+            const exact = palette.indexOf(color);
+            if (exact >= 0) { setSelectedSlot(exact); return; }
+            let best = 0, bestD = Infinity;
+            for (let i = 0; i < palette.length; i++) {
+              const p = palette[i];
+              const dr = ((p >> 16) & 0xff) - ((color >> 16) & 0xff);
+              const dg = ((p >> 8) & 0xff) - ((color >> 8) & 0xff);
+              const db = (p & 0xff) - (color & 0xff);
+              const d = dr * dr + dg * dg + db * db;
+              if (d < bestD) { bestD = d; best = i; }
+            }
+            setSelectedSlot(best);
+          }}
+          isMobile
+          onClose={() => setPanelOpen(false)}
+        />
+      )}
 
       {/* Help / info overlay */}
       {helpOpen && (
@@ -3290,7 +3688,7 @@ export default function App() {
               background: "#16161a",
               border: "1px solid #2a2a32",
               borderRadius: 14,
-              padding: "32px 40px",
+              padding: isMobile ? "20px 16px" : "32px 40px",
               maxWidth: 400,
               maxHeight: "85vh",
               overflowY: "auto",
@@ -3390,13 +3788,19 @@ export default function App() {
                   Controls
                 </div>
                 <div style={{ display: "grid", gridTemplateColumns: "auto 1fr", gap: "2px 12px", fontSize: 11, color: "#9090a0" }}>
-                  <span style={{ color: "#f0c040" }}>Click</span><span>Place pixel</span>
-                  <span style={{ color: "#f0c040" }}>Scroll</span><span>Zoom in/out</span>
-                  <span style={{ color: "#f0c040" }}>Drag</span><span>Pan the map</span>
-                  <span style={{ color: "#f0c040" }}>Arrows / WASD</span><span>Pan the map</span>
-                  <span style={{ color: "#f0c040" }}>1-9</span><span>Switch color</span>
-                  <span style={{ color: "#f0c040" }}>Tab</span><span>Eyedropper</span>
-                  <span style={{ color: "#f0c040" }}>Shift+Drag</span><span>Draw mission area</span>
+                  {isMobile ? (<>
+                    <span style={{ color: "#f0c040" }}>Tap</span><span>Place pixel</span>
+                    <span style={{ color: "#f0c040" }}>Pinch</span><span>Zoom in/out</span>
+                    <span style={{ color: "#f0c040" }}>Drag</span><span>Pan the map</span>
+                  </>) : (<>
+                    <span style={{ color: "#f0c040" }}>Click</span><span>Place pixel</span>
+                    <span style={{ color: "#f0c040" }}>Scroll</span><span>Zoom in/out</span>
+                    <span style={{ color: "#f0c040" }}>Drag</span><span>Pan the map</span>
+                    <span style={{ color: "#f0c040" }}>Arrows / WASD</span><span>Pan the map</span>
+                    <span style={{ color: "#f0c040" }}>1-9</span><span>Switch color</span>
+                    <span style={{ color: "#f0c040" }}>Tab</span><span>Eyedropper</span>
+                    <span style={{ color: "#f0c040" }}>Shift+Drag</span><span>Draw mission area</span>
+                  </>)}
                 </div>
               </div>
             )}
@@ -3496,7 +3900,7 @@ export default function App() {
                 maxHeight: 300,
                 overflowY: "auto",
               }}>
-                <p style={{ margin: "0 0 8px", fontWeight: 700, color: "#e8e8ec", fontSize: 12 }}>Privacy Policy — Last updated: April 14, 2026</p>
+                <p style={{ margin: "0 0 8px", fontWeight: 700, color: "#e8e8ec", fontSize: 12 }}>Privacy Policy — Last updated: April 16, 2026</p>
                 <p style={{ margin: "0 0 8px" }}>ICPixel is a fully decentralized application running on the Internet Computer Protocol (ICP) blockchain. There are no centralized servers, databases, or cloud infrastructure operated by us.</p>
                 <p style={{ margin: "0 0 8px", fontWeight: 700, color: "#e8e8ec" }}>We do NOT collect:</p>
                 <p style={{ margin: "0 0 8px" }}>Names, emails, phone numbers, IP addresses, browser fingerprints, cookies, tracking pixels, analytics data, location data, or any personally identifiable information (PII).</p>
@@ -3521,10 +3925,12 @@ export default function App() {
                 maxHeight: 300,
                 overflowY: "auto",
               }}>
-                <p style={{ margin: "0 0 8px", fontWeight: 700, color: "#e8e8ec", fontSize: 12 }}>Terms of Service — Last updated: April 14, 2026</p>
+                <p style={{ margin: "0 0 8px", fontWeight: 700, color: "#e8e8ec", fontSize: 12 }}>Terms of Service — Last updated: April 16, 2026</p>
                 <p style={{ margin: "0 0 8px" }}>By using ICPixel you agree to these terms. ICPixel is experimental, decentralized software for entertainment purposes only.</p>
                 <p style={{ margin: "0 0 8px", fontWeight: 700, color: "#e8e8ec" }}>No refunds:</p>
                 <p style={{ margin: "0 0 8px" }}>All transactions are final and non-refundable. This includes pixel purchases, alliance fees, and any ICP spent. We cannot reverse blockchain transactions.</p>
+                <p style={{ margin: "0 0 8px", fontWeight: 700, color: "#e8e8ec" }}>Pixel-pack deposits:</p>
+                <p style={{ margin: "0 0 8px" }}>Each pixel-pack purchase generates a unique deposit address tied to a specific ICP amount with a 30-minute payment window. You must send the exact amount shown (tolerance ±0.01 ICP below). Sending the wrong amount, the wrong token, sending after the 30-minute window expires, or sending to an inactive address may result in permanent loss of funds. We are not liable for user errors. If you believe you made a recoverable mistake, contact ICPixel@proton.me within 7 days with your order ID; we make best-effort support on a case-by-case basis and are under no obligation to recover funds.</p>
                 <p style={{ margin: "0 0 8px", fontWeight: 700, color: "#e8e8ec" }}>No guarantees:</p>
                 <p style={{ margin: "0 0 8px" }}>The Service is provided "AS IS". We do not guarantee uptime, correctness, security, or value of any digital assets. NFTs are speculative collectibles with no guaranteed value. Rewards are not dividends or guaranteed income.</p>
                 <p style={{ margin: "0 0 8px", fontWeight: 700, color: "#e8e8ec" }}>Smart contract risk:</p>
@@ -3652,6 +4058,358 @@ export default function App() {
         </div>
       )}
 
+    </div>
+  );
+}
+
+// ───── OrderModal ────────────────────────────────────────────────────
+//
+// Displays a pending deposit order: both ICRC-1 (owner.subaccount_hex)
+// and legacy AccountIdentifier formats, a QR code for mobile wallets, a
+// live countdown, and a status line driven by the polling in App.
+//
+// Does NOT do its own polling — App owns that via the effect watching
+// `activeOrder`. This component just renders what App passes in.
+function OrderModal({
+  order,
+  view,
+  error,
+  walletType,
+  onClose,
+  isMobile,
+}: {
+  order: OrderCreated;
+  view: OrderView | null;
+  error: string | null;
+  walletType: "account_id" | "icrc1";
+  onClose: () => void;
+  isMobile: boolean;
+}) {
+  const [now, setNow] = useState(Date.now());
+  const [copied, setCopied] = useState<string | null>(null);
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  const expiresMs = Number(order.expires_at_ns / 1_000_000n);
+  const remainingMs = Math.max(0, expiresMs - now);
+  const remainingMin = Math.floor(remainingMs / 60_000);
+  const remainingSec = Math.floor((remainingMs % 60_000) / 1_000);
+  const timer = `${remainingMin}:${remainingSec.toString().padStart(2, "0")}`;
+
+  const status = view?.status;
+  const paid = status && "Paid" in status;
+  const expired = status && "Expired" in status;
+  const rescued = status && "Rescued" in status;
+
+  const expectedIcp = (Number(order.expected_e8s) / 1e8).toFixed(8).replace(/0+$/, "").replace(/\.$/, "");
+  const toleranceIcp = (Number(order.tolerance_below_e8s) / 1e8).toFixed(8).replace(/0+$/, "").replace(/\.$/, "");
+
+  const ownerPrincipalStr = order.owner_principal.toString();
+
+  function copy(label: string, text: string) {
+    navigator.clipboard?.writeText(text).then(
+      () => {
+        setCopied(label);
+        setTimeout(() => setCopied(null), 1500);
+      },
+      () => {}
+    );
+  }
+
+  return (
+    <div
+      onClick={() => {
+        // Don't let people close by misclick while waiting. Close button
+        // is the only way out.
+      }}
+      style={{
+        position: "absolute",
+        inset: 0,
+        background: "rgba(0,0,0,0.7)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        zIndex: 60,
+      }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          background: "#16161a",
+          border: "1px solid #2a2a32",
+          borderRadius: 10,
+          padding: 24,
+          width: isMobile ? "92vw" : 440,
+          maxWidth: 440,
+          maxHeight: "90vh",
+          overflowY: "auto",
+          color: "#e8e8ec",
+          boxShadow: "0 20px 60px rgba(0,0,0,0.6)",
+        }}
+      >
+        {paid ? (
+          <>
+            <div style={{ fontSize: 18, fontWeight: 800, marginBottom: 8, color: "#7eed56" }}>
+              ✓ Payment received
+            </div>
+            <div style={{ fontSize: 13, color: "#9090a0", marginBottom: 14 }}>
+              +{order.pack_pixels.toString()} pixels credited. You can start placing now.
+            </div>
+            <button
+              onClick={onClose}
+              style={{
+                width: "100%",
+                padding: "10px",
+                background: "#f0c040",
+                color: "#16161a",
+                border: "none",
+                borderRadius: 6,
+                fontSize: 14,
+                fontWeight: 800,
+                cursor: "pointer",
+              }}
+            >
+              Close
+            </button>
+          </>
+        ) : expired || rescued ? (
+          <>
+            <div style={{ fontSize: 18, fontWeight: 800, marginBottom: 8, color: "#ff6b6b" }}>
+              Order expired
+            </div>
+            <div style={{ fontSize: 12, color: "#9090a0", marginBottom: 14 }}>
+              Your 30-minute payment window ran out. If you already sent ICP, contact support with
+              this order ID and we'll help recover it.
+            </div>
+            <div
+              style={{
+                fontSize: 11,
+                color: "#c8c8d0",
+                background: "#1b1b22",
+                padding: 10,
+                borderRadius: 6,
+                marginBottom: 14,
+                wordBreak: "break-all",
+                fontFamily: "ui-monospace, monospace",
+              }}
+            >
+              order_id: {order.order_id_hex}
+            </div>
+            <button
+              onClick={onClose}
+              style={{
+                width: "100%",
+                padding: "10px",
+                background: "#2a2a32",
+                color: "#e8e8ec",
+                border: "1px solid #3a3a42",
+                borderRadius: 6,
+                fontSize: 13,
+                cursor: "pointer",
+              }}
+            >
+              Close
+            </button>
+          </>
+        ) : (
+          <>
+            <div style={{ fontSize: 18, fontWeight: 800, marginBottom: 2 }}>
+              Pay for {order.pack_pixels.toString()} pixels
+            </div>
+            <div style={{ fontSize: 12, color: "#9090a0", marginBottom: 14 }}>
+              Send <span style={{ color: "#f0c040", fontWeight: 800 }}>exactly {expectedIcp} ICP</span>{" "}
+              from your wallet to the address below.
+            </div>
+
+            {walletType === "account_id" ? (
+              // ── Account ID view — one address for NNS, Coinbase, exchanges
+              <>
+                <div style={{ fontSize: 11, color: "#6a6a76", marginBottom: 4, marginTop: 2, fontWeight: 600 }}>
+                  ACCOUNT ID (NNS, Coinbase, Binance, exchanges)
+                </div>
+                <div
+                  style={{
+                    fontSize: 11,
+                    color: "#c8c8d0",
+                    background: "#1b1b22",
+                    padding: 10,
+                    borderRadius: 6,
+                    marginBottom: 6,
+                    wordBreak: "break-all",
+                    fontFamily: "ui-monospace, monospace",
+                  }}
+                >
+                  {order.account_identifier_hex}
+                </div>
+                <button
+                  onClick={() => copy("accid", order.account_identifier_hex)}
+                  style={{
+                    width: "100%",
+                    padding: 8,
+                    marginBottom: 14,
+                    background: "transparent",
+                    color: "#e8e8ec",
+                    border: "1px solid #3a3a42",
+                    borderRadius: 6,
+                    fontSize: 12,
+                    cursor: "pointer",
+                  }}
+                >
+                  {copied === "accid" ? "✓ copied" : "Copy Account ID"}
+                </button>
+              </>
+            ) : (
+              // ── ICRC-1 view — principal + subaccount for Plug, Oisy, NFID
+              <>
+                <div style={{ fontSize: 11, color: "#6a6a76", marginBottom: 4, marginTop: 2, fontWeight: 600 }}>
+                  PRINCIPAL (paste as "To" / "Owner" in your wallet)
+                </div>
+                <div
+                  style={{
+                    fontSize: 11,
+                    color: "#c8c8d0",
+                    background: "#1b1b22",
+                    padding: 10,
+                    borderRadius: 6,
+                    marginBottom: 6,
+                    wordBreak: "break-all",
+                    fontFamily: "ui-monospace, monospace",
+                  }}
+                >
+                  {ownerPrincipalStr}
+                </div>
+                <button
+                  onClick={() => copy("principal", ownerPrincipalStr)}
+                  style={{
+                    width: "100%",
+                    padding: 8,
+                    marginBottom: 10,
+                    background: "transparent",
+                    color: "#e8e8ec",
+                    border: "1px solid #3a3a42",
+                    borderRadius: 6,
+                    fontSize: 12,
+                    cursor: "pointer",
+                  }}
+                >
+                  {copied === "principal" ? "✓ copied" : "Copy Principal"}
+                </button>
+
+                <div style={{ fontSize: 11, color: "#6a6a76", marginBottom: 4, fontWeight: 600 }}>
+                  SUBACCOUNT (paste in the "Subaccount" field)
+                </div>
+                <div
+                  style={{
+                    fontSize: 11,
+                    color: "#c8c8d0",
+                    background: "#1b1b22",
+                    padding: 10,
+                    borderRadius: 6,
+                    marginBottom: 6,
+                    wordBreak: "break-all",
+                    fontFamily: "ui-monospace, monospace",
+                  }}
+                >
+                  {order.subaccount_hex}
+                </div>
+                <button
+                  onClick={() => copy("subaccount", order.subaccount_hex)}
+                  style={{
+                    width: "100%",
+                    padding: 8,
+                    marginBottom: 14,
+                    background: "transparent",
+                    color: "#e8e8ec",
+                    border: "1px solid #3a3a42",
+                    borderRadius: 6,
+                    fontSize: 12,
+                    cursor: "pointer",
+                  }}
+                >
+                  {copied === "subaccount" ? "✓ copied" : "Copy Subaccount"}
+                </button>
+              </>
+            )}
+
+            {/* Warnings */}
+            <div
+              style={{
+                fontSize: 11,
+                color: "#f0c040",
+                background: "rgba(240,192,64,0.08)",
+                border: "1px solid rgba(240,192,64,0.3)",
+                padding: 10,
+                borderRadius: 6,
+                marginBottom: 14,
+                lineHeight: 1.5,
+              }}
+            >
+              <div>⚠ Send EXACTLY {expectedIcp} ICP (tolerance ±{toleranceIcp} ICP)</div>
+              <div>⚠ Other amounts may not be credited automatically</div>
+              <div>⚠ Send ONLY ICP — other tokens will be lost</div>
+              <div>⚠ Deposits are non-refundable (see Terms of Service)</div>
+            </div>
+
+            {/* Transient error from the polling loop (ledger down, network
+                blip, etc). Doesn't end the flow — next successful poll
+                clears it. */}
+            {error && (
+              <div
+                style={{
+                  fontSize: 12,
+                  color: "#ff8080",
+                  background: "rgba(255,80,80,0.08)",
+                  border: "1px solid rgba(255,80,80,0.3)",
+                  padding: "8px 10px",
+                  borderRadius: 6,
+                  marginBottom: 12,
+                }}
+              >
+                {error}
+              </div>
+            )}
+
+            {/* Status + timer */}
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                fontSize: 12,
+                color: "#9090a0",
+                marginBottom: 14,
+              }}
+            >
+              <span>
+                {view && view.current_balance_e8s > 0n
+                  ? `Received: ${(Number(view.current_balance_e8s) / 1e8).toFixed(4)} ICP`
+                  : "Waiting for payment…"}
+              </span>
+              <span style={{ color: remainingMs < 60_000 ? "#ff6b6b" : "#c8c8d0" }}>
+                Expires in {timer}
+              </span>
+            </div>
+
+            <button
+              onClick={onClose}
+              style={{
+                width: "100%",
+                padding: 8,
+                background: "transparent",
+                color: "#9090a0",
+                border: "1px solid #2a2a32",
+                borderRadius: 6,
+                fontSize: 12,
+                cursor: "pointer",
+              }}
+            >
+              I'll pay later — close
+            </button>
+          </>
+        )}
+      </div>
     </div>
   );
 }
