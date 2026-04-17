@@ -150,12 +150,72 @@ fn admin_credit_treasury(amount_e8s: u64) -> Result<u64, String> {
     Ok(state::game_state().treasury_balance_e8s.unwrap_or(0))
 }
 
+/// Frontend-facing payout destination. The typed ICRC-1 variant carries
+/// subaccount as a hex string for ergonomics (JS has no 32-byte array
+/// literal); backend parses it before calling the ledger.
+#[derive(candid::CandidType, serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub enum PayoutDestArg {
+    /// Send to the caller's Internet Identity principal, default subaccount.
+    Default,
+    /// Legacy 32-byte AccountIdentifier as a 64-char hex string.
+    AccountId { hex: String },
+    /// ICRC-1 destination. `subaccount_hex` optional; when given must be
+    /// exactly 64 hex chars (32 bytes).
+    Icrc1 {
+        owner: candid::Principal,
+        subaccount_hex: Option<String>,
+    },
+}
+
+fn resolve_payout_dest(
+    caller: candid::Principal,
+    arg: PayoutDestArg,
+) -> Result<crate::icp_ledger::PayoutDest, String> {
+    use crate::icp_ledger::PayoutDest;
+    match arg {
+        PayoutDestArg::Default => Ok(PayoutDest::from_icrc1(caller, None)),
+        PayoutDestArg::AccountId { hex } => {
+            let bytes = hex::decode(&hex).map_err(|e| format!("bad account_id hex: {e}"))?;
+            if bytes.len() != 32 {
+                return Err(format!(
+                    "account_id must be 32 bytes (64 hex chars), got {}",
+                    bytes.len()
+                ));
+            }
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            Ok(PayoutDest::from_account_id(arr))
+        }
+        PayoutDestArg::Icrc1 { owner, subaccount_hex } => {
+            let sub = if let Some(h) = subaccount_hex {
+                let bytes = hex::decode(&h).map_err(|e| format!("bad subaccount hex: {e}"))?;
+                if bytes.len() != 32 {
+                    return Err(format!(
+                        "subaccount must be 32 bytes (64 hex chars), got {}",
+                        bytes.len()
+                    ));
+                }
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&bytes);
+                Some(arr)
+            } else {
+                None
+            };
+            Ok(PayoutDest::from_icrc1(owner, sub))
+        }
+    }
+}
+
 #[update]
 async fn claim_mission_reward(
     id: AllianceId,
     round_index: u32,
+    dest: PayoutDestArg,
 ) -> Result<ClaimResult, AllianceError> {
-    alliance::claim_mission_reward(caller_or_anon(), id, round_index).await
+    let caller = caller_or_anon();
+    let resolved = resolve_payout_dest(caller, dest)
+        .map_err(AllianceError::PaymentFailed)?;
+    alliance::claim_mission_reward(caller, id, round_index, resolved).await
 }
 
 #[update]
@@ -221,6 +281,29 @@ fn admin_set_map_size(new_size: u16) -> Result<(), String> {
 #[query]
 fn get_alliance_billing() -> billing::Billing {
     billing::get()
+}
+
+/// Public view of the treasury's deposit address in all three formats.
+/// Open query so admins can display it and anyone who wants to donate
+/// directly to treasury can use it. The destination is
+/// `billing.treasury_principal`'s default subaccount.
+#[derive(candid::CandidType, serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct TreasuryAddress {
+    pub owner_principal: candid::Principal,
+    pub subaccount_hex: String,
+    pub account_identifier_hex: String,
+}
+
+#[query]
+fn get_treasury_address() -> TreasuryAddress {
+    let cfg = billing::get();
+    let owner = cfg.treasury_principal;
+    let subaccount: [u8; 32] = [0u8; 32];
+    TreasuryAddress {
+        owner_principal: owner,
+        subaccount_hex: hex::encode(subaccount),
+        account_identifier_hex: billing::account_identifier_hex(owner, subaccount),
+    }
 }
 
 
@@ -289,6 +372,22 @@ fn get_packs() -> Vec<billing::PixelPack> {
     billing::packs()
 }
 
+/// Alliance creation cost: current price + next tier price (if any).
+#[derive(candid::CandidType, serde::Serialize)]
+struct AlliancePriceInfo {
+    current: u64,
+    next: Option<u64>,
+}
+
+#[query]
+fn get_alliance_price_pixels() -> AlliancePriceInfo {
+    let count = state::NEXT_ALLIANCE_ID.with(|c| *c.borrow().get()) - 1;
+    AlliancePriceInfo {
+        current: billing::alliance_price_pixels(count),
+        next: billing::alliance_next_price_pixels(count),
+    }
+}
+
 // ───── Deposit-order flow ─────
 //
 // Replaces the old `buy_pack(ICRC-2 approve + transfer_from)` flow. Player
@@ -348,6 +447,20 @@ async fn create_order(pack_id: u8) -> Result<OrderCreated, String> {
     }
     if state::game_state().paused {
         return Err("game is paused".into());
+    }
+
+    // Rate limit: max 5 pending orders per principal to prevent
+    // stable-memory exhaustion via order spam.
+    let pending_count = state::PENDING_ORDERS.with(|m| {
+        m.borrow()
+            .iter()
+            .filter(|(_, o)| {
+                o.principal == caller && matches!(o.status, billing::OrderStatus::Pending)
+            })
+            .count()
+    });
+    if pending_count >= 5 {
+        return Err("too many pending orders — wait for existing ones to expire".into());
     }
 
     let pack = billing::packs()
@@ -516,7 +629,7 @@ async fn admin_payout_wallet() -> Result<u64, String> {
     // `transfer_drain` handles fee subtraction and BadFee retry centrally;
     // returns the net amount actually transferred.
     let amount = icp_ledger::transfer_drain(ledger, cfg.wallet_principal, pending).await?;
-    state::reset_wallet_pending()?;
+    state::debit_wallet_pending(pending)?;
     Ok(amount)
 }
 
@@ -556,8 +669,10 @@ async fn distribute_treasury() -> Result<treasury::DistributeReport, String> {
 /// season distribution into their account via `icrc1_transfer`. The
 /// ledger fee is taken from the credited amount.
 #[update]
-async fn claim_treasury() -> Result<u64, String> {
-    treasury::claim_treasury(caller_or_anon()).await
+async fn claim_treasury(dest: PayoutDestArg) -> Result<u64, String> {
+    let caller = caller_or_anon();
+    let resolved = resolve_payout_dest(caller, dest)?;
+    treasury::claim_treasury(caller, resolved).await
 }
 
 #[query]
@@ -811,12 +926,40 @@ fn arm_icp_price_timer() {
     use std::time::Duration;
     // XRC and ledger-fee refresh DISABLED — pixel pack prices are now
     // hardcoded in ICP (not USD-pegged), so no exchange rate is needed.
-    // Saves ~$1.60/month in cycles on mainnet. Re-enable if pricing
-    // switches back to USD-denominated.
 
     // Cycles health log — every 5 minutes. Cheap (no inter-canister calls).
     ic_cdk_timers::set_timer_interval(Duration::from_secs(300), || {
         check_cycles_and_log();
+    });
+
+    // Auto-payout: every 10 minutes, drain wallet_pending to
+    // billing.wallet_principal if there's anything above ledger fee.
+    // One inter-canister call per tick when balance > 0, zero otherwise.
+    ic_cdk_timers::set_timer_interval(Duration::from_secs(600), || {
+        let pending = state::wallet_pending_e8s();
+        let fee = icp_ledger::cached_ledger_fee();
+        if pending <= fee {
+            return; // nothing worth sending
+        }
+        let cfg = billing::get();
+        let ledger = match cfg.ledger {
+            Some(l) => l,
+            None => return,
+        };
+        ic_cdk::spawn(async move {
+            match icp_ledger::transfer_drain(ledger, cfg.wallet_principal, pending).await {
+                Ok(net) => {
+                    let _ = state::debit_wallet_pending(pending);
+                    ic_cdk::println!(
+                        "auto-payout: sent {} e8s to {}",
+                        net, cfg.wallet_principal
+                    );
+                }
+                Err(e) => {
+                    ic_cdk::println!("auto-payout failed (will retry): {e}");
+                }
+            }
+        });
     });
 }
 

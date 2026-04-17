@@ -1,5 +1,6 @@
 import { useEffect, useState, useCallback, useRef } from "react";
 import type { BackendActor, GameState, AlliancePublic, LeaderboardPage } from "./idl";
+import Collection from "./Collection";
 
 // ── Constants ────────────────────────────────────────────────────────
 // Mirrors STAGES in src/backend/src/map.rs.
@@ -48,6 +49,7 @@ export default function Dashboard({ actor, initialState, alliances, onPlay }: Da
   const [lb, setLb] = useState<LeaderboardPage | null>(null);
   const [lastRefresh, setLastRefresh] = useState(0);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [tab, setTab] = useState<"alliances" | "collection">("alliances");
 
   const refresh = useCallback(async () => {
     try {
@@ -208,6 +210,14 @@ export default function Dashboard({ actor, initialState, alliances, onPlay }: Da
           <span className="dash-card-dim" style={{ marginTop: 6, fontSize: 11 }}>
             Split among all NFT holders at season end
           </span>
+          <a
+            href="https://dashboard.internetcomputer.org/account/a3827007b9233c4503f31ec4bd49510594c88f50a056cf576c3607547aa5bec2"
+            target="_blank"
+            rel="noopener noreferrer"
+            style={{ marginTop: 6, fontSize: 10, color: "#5fa8ff", textDecoration: "none" }}
+          >
+            View on explorer →
+          </a>
         </div>
       </div>
 
@@ -261,24 +271,38 @@ export default function Dashboard({ actor, initialState, alliances, onPlay }: Da
         </div>
       </div>
 
-      {/* ── Alliances / Streaks tabbed section ──────────────────── */}
+      {/* ── Tabbed section (Alliances / Collection) ──────────────────── */}
       <div className="dash-section">
         <div style={{ display: "flex", gap: 0, borderBottom: "1px solid #2a2a32", marginBottom: 12 }}>
-          <span style={{
-            flex: 1,
-            padding: "8px 0",
-            borderBottom: "2px solid #51e9f4",
-            color: "#e8e8ec",
-            fontWeight: 700,
-            fontSize: 13,
-            textTransform: "uppercase",
-            letterSpacing: 1,
-          }}>
-            Alliances ({lb ? Number(lb.total) : 0})
-          </span>
+          {([
+            { id: "alliances", label: `Alliances (${lb ? Number(lb.total) : 0})` },
+            { id: "collection", label: "Collection" },
+          ] as const).map(({ id, label }) => (
+            <button
+              key={id}
+              onClick={() => setTab(id)}
+              style={{
+                flex: 1,
+                padding: "8px 0",
+                borderBottom: tab === id ? "2px solid #51e9f4" : "2px solid transparent",
+                background: "transparent",
+                color: tab === id ? "#e8e8ec" : "#888",
+                fontWeight: 700,
+                fontSize: 13,
+                textTransform: "uppercase",
+                letterSpacing: 1,
+                cursor: "pointer",
+                fontFamily: "inherit",
+              }}
+            >
+              {label}
+            </button>
+          ))}
         </div>
 
-        {lb && lb.entries.length > 0 ? (
+        {tab === "collection" ? (
+          <Collection />
+        ) : lb && lb.entries.length > 0 ? (
               <div className="dash-alliance-grid">
                 {lb.entries.map((e) => {
                   const rank = Number(e.rank);

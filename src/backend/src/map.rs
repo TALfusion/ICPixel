@@ -197,15 +197,16 @@ pub fn place_pixel(
         });
     }
 
-    // Billing: if pixels are priced, require and decrement a credit.
-    // Free mode (`pixel_price_usd_cents == 0`) skips the credit system entirely.
-    if cfg.pixel_price_usd_cents > 0 {
-        let had = PIXEL_CREDITS.with(|m| m.borrow().get(&principal).unwrap_or(0));
-        if had == 0 {
-            return Err(PlaceError::NoCredits);
-        }
-        PIXEL_CREDITS.with(|m| m.borrow_mut().insert(principal, had - 1));
+    // Billing: every placement consumes one pixel credit. Credits are
+    // bought via deposit-order flow (`create_order` / `check_order`) or
+    // granted for testing by controllers via `admin_grant_credits`.
+    // `cfg.pixel_price_usd_cents` is a legacy field kept only for upgrade
+    // decode — the live price lives in the hardcoded pack catalogue.
+    let had = PIXEL_CREDITS.with(|m| m.borrow().get(&principal).unwrap_or(0));
+    if had == 0 {
+        return Err(PlaceError::NoCredits);
     }
+    PIXEL_CREDITS.with(|m| m.borrow_mut().insert(principal, had - 1));
 
     COOLDOWN_CACHE.with(|m| {
         m.borrow_mut().insert(principal, now_ns);
@@ -231,8 +232,11 @@ pub fn place_pixel(
     // Append to change log.
     let version = NEXT_VERSION.with(|c| {
         let cur = *c.borrow().get();
+        let next = cur.checked_add(1).ok_or_else(|| {
+            PlaceError::InternalError("version counter overflow".into())
+        })?;
         c.borrow_mut()
-            .set(cur + 1)
+            .set(next)
             .map(|_| cur)
             .map_err(|e| PlaceError::InternalError(format!("version bump: {e:?}")))
     })?;
@@ -296,7 +300,7 @@ pub fn read_region(x: i16, y: i16, w: u16, h: u16) -> Vec<u32> {
 
 /// Returns the season-end deadline (ns) if the final stage has been reached.
 pub fn season_ended_at(gs: &crate::types::GameState) -> Option<u64> {
-    gs.final_stage_reached_at.map(|t| t + SEASON_TAIL_NS)
+    gs.final_stage_reached_at.map(|t| t.saturating_add(SEASON_TAIL_NS))
 }
 
 /// TEMP debug helper: paints the map with a sweep of r/place palette colors,

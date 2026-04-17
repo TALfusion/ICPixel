@@ -17,7 +17,13 @@ use crate::state::{
 };
 use candid::Principal;
 
-const MIN_MISSION_DIM: u16 = 5;
+/// Hybrid minimum: each side must be ≥ `MIN_MISSION_DIM` AND the total
+/// area must be ≥ `MIN_MISSION_AREA`. The area floor keeps the "mass"
+/// of a mission comparable to the old 5×5=25 minimum, while the side
+/// floor rejects degenerate 1×N / 2×N strips that trivialize the
+/// 95%-match completion condition.
+const MIN_MISSION_DIM: u16 = 3;
+const MIN_MISSION_AREA: u32 = 25;
 const MISSION_COMPLETE_PERCENT: u32 = 95;
 /// Max % of the mission template that can already be on the map at the
 /// moment a new alliance is created. Above this we reject — see comment in
@@ -78,26 +84,9 @@ pub fn upgrade_mission(
     {
         return Err(AllianceError::UpgradeMustContainOld);
     }
-    // Old pixels must be byte-identical at their offsets in the new template.
-    let dx = ((old.x as i32) - (new_mission.x as i32)) as usize;
-    let dy = ((old.y as i32) - (new_mission.y as i32)) as usize;
-    let nw = new_mission.width as usize;
-    let ow = old.width as usize;
-    let oh = old.height as usize;
-    for row in 0..oh {
-        for col in 0..ow {
-            let old_idx = row * ow + col;
-            let new_idx = (dy + row) * nw + (dx + col);
-            if new_idx >= new_mission.template.len() {
-                return Err(AllianceError::InvalidMission(
-                    "new template too small to contain old pixels".into(),
-                ));
-            }
-            if new_mission.template[new_idx] != old.template[old_idx] {
-                return Err(AllianceError::OldPixelsModified);
-            }
-        }
-    }
+    // Old pixel match check removed — leaders can freely redesign the art
+    // inside the old footprint when upgrading. The only geometric constraint
+    // that remains is containment (new rect ⊇ old rect).
 
     // Tile-index update: drop the old mission's bucket entries, then add
     // the new mission's. Done before the ALLIANCES write so a panic in
@@ -224,8 +213,11 @@ pub async fn create_alliance(
 
     let id = NEXT_ALLIANCE_ID.with(|c| {
         let cur = *c.borrow().get();
+        let next = cur.checked_add(1).ok_or_else(|| {
+            AllianceError::InternalError("alliance id overflow".into())
+        })?;
         c.borrow_mut()
-            .set(cur + 1)
+            .set(next)
             .map(|_| cur)
             .map_err(|e| AllianceError::InternalError(format!("alliance id bump: {e:?}")))
     })?;
@@ -352,6 +344,7 @@ pub fn list_alliances() -> Vec<AlliancePublic> {
     let mut v: Vec<AlliancePublic> =
         ALLIANCES.with(|a| a.borrow().iter().map(|(_, v)| v.to_public()).collect());
     sort_by_rank(&mut v);
+    v.truncate(500);
     v
 }
 
@@ -404,7 +397,13 @@ pub fn leaderboard(caller: Principal, offset: u64, limit: u64) -> LeaderboardPag
 fn validate_mission(m: &Mission) -> Result<(), AllianceError> {
     if m.width < MIN_MISSION_DIM || m.height < MIN_MISSION_DIM {
         return Err(AllianceError::InvalidMission(format!(
-            "min size is {MIN_MISSION_DIM}x{MIN_MISSION_DIM}"
+            "each side must be ≥ {MIN_MISSION_DIM}"
+        )));
+    }
+    let area = (m.width as u32) * (m.height as u32);
+    if area < MIN_MISSION_AREA {
+        return Err(AllianceError::InvalidMission(format!(
+            "total area must be ≥ {MIN_MISSION_AREA} cells (got {area})"
         )));
     }
     // Centered bounds: every cell of the mission rect must lie inside the
@@ -938,6 +937,11 @@ pub async fn maybe_mint_for_pixel(x: i16, y: i16) {
         // failed mint doesn't leave the round in a half-closed state where
         // contributions keep coming in for an already-completed mission.
         let now_ns = ic_cdk::api::time();
+        // Save the round index BEFORE the await so we can write the NFT
+        // token id to the correct round afterwards (upgrade_mission could
+        // append a new round during the mint await).
+        let closed_round_index = crate::state::rounds_of(id)
+            .and_then(|r| r.last().map(|last| last.round_index));
         close_active_round(id, now_ns);
 
         let args = nft_client::MintArgs {
@@ -982,12 +986,16 @@ pub async fn maybe_mint_for_pixel(x: i16, y: i16) {
         // Mirror the token id into the round, so a closed round always
         // knows which NFT it produced even after the alliance's *current*
         // round (and `Alliance.nft_token_id`) moves on via upgrade_mission.
+        // Uses the saved round_index (not last_mut) because upgrade_mission
+        // could have appended a new round during the mint await.
         if let Ok(token_id) = &mint_result {
-            let _ = crate::state::mutate_rounds(id, |rounds| {
-                if let Some(round) = rounds.last_mut() {
-                    round.nft_token_id = Some(*token_id);
-                }
-            });
+            if let Some(ri) = closed_round_index {
+                let _ = crate::state::mutate_rounds(id, |rounds| {
+                    if let Some(round) = rounds.get_mut(ri as usize) {
+                        round.nft_token_id = Some(*token_id);
+                    }
+                });
+            }
         }
         if let Ok(_token_id) = &mint_result {
             // Record last completed mission in GameState for frontend banner.
@@ -1176,7 +1184,11 @@ pub async fn claim_mission_reward(
     caller: Principal,
     id: AllianceId,
     round_index: u32,
+    dest: crate::icp_ledger::PayoutDest,
 ) -> Result<ClaimResult, AllianceError> {
+    if game_state().paused {
+        return Err(AllianceError::Paused);
+    }
     if caller == Principal::anonymous() {
         return Err(AllianceError::Unauthorized);
     }
@@ -1214,20 +1226,37 @@ pub async fn claim_mission_reward(
         return Err(AllianceError::AlreadyClaimed);
     }
 
+    // --- Race guard: add caller to claimed_principals BEFORE the async
+    // transfer so a concurrent call sees them and computes claimable == 0.
+    // If the transfer fails we remove the sentinel so the player can retry.
+    crate::state::mutate_rounds(id, |rounds| {
+        if let Some(r) = rounds.get_mut(round_index as usize) {
+            if !r.claimed_principals.contains(&caller) {
+                r.claimed_principals.push(caller);
+            }
+        }
+    })
+    .map_err(AllianceError::InternalError)?;
+
     // --- Transfer ICP to caller BEFORE recording the claim ---
     // If transfer fails, claim is not recorded → player can retry.
     let cfg = crate::billing::get();
-    let transferred = if let Some(ledger) = cfg.ledger {
-        match crate::icp_ledger::transfer_drain(ledger, caller, claimable).await {
-            Ok(net) => {
+    let (transferred, block_index) = if let Some(ledger) = cfg.ledger {
+        match crate::icp_ledger::drain_to_dest(ledger, &dest, claimable).await {
+            Ok((net, idx)) => {
                 ic_cdk::println!(
-                    "claim_mission_reward: transferred {} e8s to {} (alliance {}, round {})",
-                    net, caller, id, round_index
+                    "claim_mission_reward: transferred {} e8s (block {}) to {:?} (alliance {}, round {})",
+                    net, idx, dest, id, round_index
                 );
-                true
+                (true, Some(idx))
             }
             Err(e) => {
-                // Transfer failed — do NOT record claim so player can retry.
+                // Transfer failed — remove the sentinel so player can retry.
+                let _ = crate::state::mutate_rounds(id, |rounds| {
+                    if let Some(r) = rounds.get_mut(round_index as usize) {
+                        r.claimed_principals.retain(|p| *p != caller);
+                    }
+                });
                 return Err(AllianceError::PaymentFailed(format!(
                     "ICP transfer failed: {e}"
                 )));
@@ -1235,7 +1264,7 @@ pub async fn claim_mission_reward(
         }
     } else {
         // No ledger configured — bookkeeping only (free mode / pre-mainnet).
-        false
+        (false, None)
     };
 
     // --- Record the claim (only reached on successful transfer or free mode) ---
@@ -1258,5 +1287,6 @@ pub async fn claim_mission_reward(
     Ok(ClaimResult {
         share_e8s: claimable,
         transferred,
+        block_index,
     })
 }

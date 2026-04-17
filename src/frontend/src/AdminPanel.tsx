@@ -35,21 +35,45 @@ export default function AdminPanel({ actor, onClose }: Props) {
   const [stats, setStats] = useState<AdminStats | null>(null);
   const [loading, setLoading] = useState(true);
   const [msg, setMsg] = useState<string | null>(null);
+  const [treasury, setTreasury] = useState<{
+    owner: string;
+    subaccount: string;
+    accountId: string;
+  } | null>(null);
+  const [copied, setCopied] = useState<string | null>(null);
 
   // Price input
   const [priceInput, setPriceInput] = useState("");
 
   const refresh = useCallback(async () => {
     try {
-      const s = await actor.get_admin_stats();
+      const [s, t] = await Promise.all([
+        actor.get_admin_stats(),
+        actor.get_treasury_address(),
+      ]);
       setStats(s);
       setPriceInput(String(s.pixel_price_usd_cents));
+      setTreasury({
+        owner: t.owner_principal.toString(),
+        subaccount: t.subaccount_hex,
+        accountId: t.account_identifier_hex,
+      });
     } catch (e) {
       setMsg("Failed to load stats: " + String(e));
     } finally {
       setLoading(false);
     }
   }, [actor]);
+
+  function copy(key: string, text: string) {
+    navigator.clipboard?.writeText(text).then(
+      () => {
+        setCopied(key);
+        setTimeout(() => setCopied(null), 1500);
+      },
+      () => {}
+    );
+  }
 
   useEffect(() => {
     refresh();
@@ -239,6 +263,69 @@ export default function AdminPanel({ actor, onClose }: Props) {
         <MetricCard label="Cooldown" value={`${stats.pixel_cooldown_seconds}s`} />
         <MetricCard label="Status" value={stats.paused ? "PAUSED" : "LIVE"} warn={stats.paused} />
       </div>
+
+      {/* Treasury address — three formats, all pointing at the same
+          canister subaccount 0. Shared publicly so anyone who wants to
+          donate directly (outside the deposit-order flow) can do so. */}
+      {treasury && (
+        <>
+          <h3 style={{ fontSize: 14, marginTop: 20, marginBottom: 10, color: "#888" }}>
+            TREASURY ADDRESS
+          </h3>
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            {[
+              { key: "accid", label: "Account ID", value: treasury.accountId, hint: "NNS, Coinbase, Binance, exchanges" },
+              { key: "principal", label: "Principal", value: treasury.owner, hint: "Plug, Oisy, NFID" },
+              { key: "sub", label: "Subaccount (hex)", value: treasury.subaccount, hint: "ICRC-1 — paired with Principal above" },
+            ].map((row) => (
+              <div
+                key={row.key}
+                style={{
+                  background: "rgba(255,255,255,0.03)",
+                  border: "1px solid #333",
+                  borderRadius: 6,
+                  padding: "10px 12px",
+                }}
+              >
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+                  <span style={{ fontSize: 11, color: "#888", fontWeight: 600, letterSpacing: 0.5, textTransform: "uppercase" }}>
+                    {row.label}
+                  </span>
+                  <span style={{ fontSize: 10, color: "#666" }}>{row.hint}</span>
+                </div>
+                <div
+                  style={{
+                    fontSize: 11,
+                    color: "#c8c8d0",
+                    background: "#1b1b22",
+                    padding: 8,
+                    borderRadius: 4,
+                    marginBottom: 6,
+                    wordBreak: "break-all",
+                    fontFamily: "ui-monospace, monospace",
+                  }}
+                >
+                  {row.value}
+                </div>
+                <button
+                  onClick={() => copy(row.key, row.value)}
+                  style={{
+                    padding: "4px 10px",
+                    background: "transparent",
+                    color: "#9090a0",
+                    border: "1px solid #2a2a32",
+                    borderRadius: 4,
+                    fontSize: 11,
+                    cursor: "pointer",
+                  }}
+                >
+                  {copied === row.key ? "✓ copied" : "copy"}
+                </button>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
 
       {/* Actions */}
       <h3 style={{ fontSize: 14, marginTop: 20, marginBottom: 10, color: "#888" }}>ACTIONS</h3>

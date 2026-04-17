@@ -63,6 +63,13 @@ export type AllianceError = { 'NameEmpty' : null } |
 export type AllianceOrPublic = { 'Full' : Alliance } |
   { 'Public' : AlliancePublic };
 /**
+ * Alliance creation cost: current price + next tier price (if any).
+ */
+export interface AlliancePriceInfo {
+  'next' : [] | [bigint],
+  'current' : bigint,
+}
+/**
  * Public view (no mission) — what non-members see in `list_alliances`.
  */
 export interface AlliancePublic {
@@ -168,10 +175,14 @@ export interface ChangesResponse {
  */
 export interface ClaimResult {
   /**
+   * ICP ledger block index of the transfer, when `transferred == true`.
+   * Frontend builds a dashboard.internetcomputer.org link from this.
+   */
+  'block_index' : [] | [bigint],
+  /**
    * Whether the e8s were actually transferred to the caller's wallet.
-   * Currently always `false` — Phase 1 implements bookkeeping only;
-   * real ICRC-1 transfers ship in Phase 2 alongside the rest of the
-   * payment plumbing.
+   * `false` in free mode (share_e8s == 0 or ledger not wired); `true`
+   * on a successful `drain_to_dest`.
    */
   'transferred' : boolean,
   'share_e8s' : bigint,
@@ -540,6 +551,30 @@ export interface OrderView {
   'expires_at_ns' : bigint,
   'order_id_hex' : string,
 }
+/**
+ * Frontend-facing payout destination. The typed ICRC-1 variant carries
+ * subaccount as a hex string for ergonomics (JS has no 32-byte array
+ * literal); backend parses it before calling the ledger.
+ */
+export type PayoutDestArg = {
+    /**
+     * ICRC-1 destination. `subaccount_hex` optional; when given must be
+     * exactly 64 hex chars (32 bytes).
+     */
+    'Icrc1' : { 'subaccount_hex' : [] | [string], 'owner' : Principal }
+  } |
+  {
+    /**
+     * Send to the caller's Internet Identity principal, default subaccount.
+     */
+    'Default' : null
+  } |
+  {
+    /**
+     * Legacy 32-byte AccountIdentifier as a 64-char hex string.
+     */
+    'AccountId' : { 'hex' : string }
+  };
 export interface PendingOrder {
   'status' : OrderStatus,
   'principal' : Principal,
@@ -626,6 +661,17 @@ export type Result_8 = { 'Ok' : null } |
   { 'Err' : AllianceError };
 export type Result_9 = { 'Ok' : MissionContributionView } |
   { 'Err' : AllianceError };
+/**
+ * Public view of the treasury's deposit address in all three formats.
+ * Open query so admins can display it and anyone who wants to donate
+ * directly to treasury can use it. The destination is
+ * `billing.treasury_principal`'s default subaccount.
+ */
+export interface TreasuryAddress {
+  'subaccount_hex' : string,
+  'account_identifier_hex' : string,
+  'owner_principal' : Principal,
+}
 /**
  * Per-user streak stats. Stored in `USER_STATS` stable map (MemoryId 16).
  * Updated on every `place_pixel`: if the player placed yesterday →
@@ -780,13 +826,16 @@ export interface _SERVICE {
    */
   'check_order' : ActorMethod<[string], Result_3>,
   'chunk_size' : ActorMethod<[], number>,
-  'claim_mission_reward' : ActorMethod<[bigint, number], Result_4>,
+  'claim_mission_reward' : ActorMethod<
+    [bigint, number, PayoutDestArg],
+    Result_4
+  >,
   /**
    * User-facing pull. Drains the caller's claimable share from the
    * season distribution into their account via `icrc1_transfer`. The
    * ledger fee is taken from the credited amount.
    */
-  'claim_treasury' : ActorMethod<[], Result>,
+  'claim_treasury' : ActorMethod<[PayoutDestArg], Result>,
   'create_alliance' : ActorMethod<[string, string, Mission, string], Result_5>,
   /**
    * Create a deposit order for the given pack. Rejects anonymous callers.
@@ -810,6 +859,7 @@ export interface _SERVICE {
   'get_admin_stats' : ActorMethod<[], AdminStats>,
   'get_alliance' : ActorMethod<[bigint], [] | [AllianceOrPublic]>,
   'get_alliance_billing' : ActorMethod<[], Billing>,
+  'get_alliance_price_pixels' : ActorMethod<[], AlliancePriceInfo>,
   'get_changes_since' : ActorMethod<[bigint, [] | [bigint]], ChangesResponse>,
   'get_claimable_treasury' : ActorMethod<[Principal], bigint>,
   'get_game_state' : ActorMethod<[], GameState>,
@@ -824,6 +874,7 @@ export interface _SERVICE {
   'get_packs' : ActorMethod<[], Array<PixelPack>>,
   'get_pixel_credits' : ActorMethod<[Principal], bigint>,
   'get_snapshot_reader' : ActorMethod<[], [] | [Principal]>,
+  'get_treasury_address' : ActorMethod<[], TreasuryAddress>,
   'get_treasury_balance' : ActorMethod<[], bigint>,
   'get_version' : ActorMethod<[], VersionInfo>,
   'get_wallet_pending_e8s' : ActorMethod<[], bigint>,

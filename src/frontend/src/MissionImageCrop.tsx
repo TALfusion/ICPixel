@@ -1,7 +1,7 @@
 import { useRef, useState, useEffect, useCallback } from "react";
 
 /**
- * Crop-to-grid mission image picker.
+ * Crop-to-grid mission image picker with pixel touch-up editor.
  *
  * The user drops / pastes / browses an image. It's displayed overlaid on a
  * W×H pixel grid (the mission rect). They can drag to reposition and scroll
@@ -9,9 +9,8 @@ import { useRef, useState, useEffect, useCallback } from "react";
  * and snap it to the nearest palette color — producing the template array
  * the backend expects.
  *
- * This replaces the old "upload → auto-downscale → garbage" flow with a
- * WYSIWYG approach: you see exactly what each cell will look like before
- * you commit.
+ * After the image is positioned, the user can toggle "edit" mode to click
+ * individual pixels and repaint them with a chosen palette color.
  */
 
 // r/place 2022 palette — must match DEFAULT_PALETTE in App.tsx.
@@ -26,6 +25,10 @@ const PALETTE_RGB = [
   [0x51, 0x52, 0x52], [0x89, 0x8d, 0x90], [0xd4, 0xd7, 0xd9], [0xff, 0xff, 0xff],
 ] as const;
 
+const PALETTE_HEX: number[] = PALETTE_RGB.map(
+  ([r, g, b]) => (r << 16) | (g << 8) | b,
+);
+
 function nearestPalette(r: number, g: number, b: number): number {
   let best = 0;
   let bestD = Infinity;
@@ -36,6 +39,10 @@ function nearestPalette(r: number, g: number, b: number): number {
   }
   const [r2, g2, b2] = PALETTE_RGB[best];
   return (r2 << 16) | (g2 << 8) | b2;
+}
+
+function hexStr(c: number): string {
+  return "#" + c.toString(16).padStart(6, "0");
 }
 
 interface Props {
@@ -78,6 +85,13 @@ export default function MissionImageCrop({
   // Preview canvas.
   const previewRef = useRef<HTMLCanvasElement>(null);
 
+  // ── Pixel touch-up editor state ──
+  const [editing, setEditing] = useState(false);
+  const [paintColor, setPaintColor] = useState(PALETTE_HEX[27]); // black default
+  // The current template as mutable array — kept in a ref so edits don't
+  // trigger the sampling effect (which would overwrite them).
+  const tplRef = useRef<number[] | null>(null);
+
   // Load image into a bitmap + an offscreen canvas for pixel sampling.
   // No dependency on gridW/gridH — fit is recomputed in the sampling effect.
   const loadImage = useCallback(async (file: File) => {
@@ -103,6 +117,7 @@ export default function MissionImageCrop({
     setOffX(0);
     setOffY(0);
     setNeedsFit(true);
+    setEditing(false);
   }, []);
 
   // Paste handler.
@@ -156,8 +171,12 @@ export default function MissionImageCrop({
   useEffect(() => {
     if (!imageBitmap || !srcDataRef.current) {
       onTemplate(null);
+      tplRef.current = null;
       return;
     }
+    // Skip resampling while in edit mode — edits are the source of truth.
+    if (editing) return;
+
     cancelAnimationFrame(sampleRaf.current);
     sampleRaf.current = requestAnimationFrame(() => {
     const bw = imageBitmap.width;
@@ -182,65 +201,129 @@ export default function MissionImageCrop({
         }
       }
     }
+    tplRef.current = tpl;
     onTemplate(tpl);
-
-    // Draw preview.
-    const pc = previewRef.current;
-    if (pc) {
-      pc.width = gridW;
-      pc.height = gridH;
-      const pctx = pc.getContext("2d")!;
-      const img = pctx.createImageData(gridW, gridH);
-      for (let i = 0; i < tpl.length; i++) {
-        const c = tpl[i];
-        img.data[i * 4 + 0] = (c >> 16) & 0xff;
-        img.data[i * 4 + 1] = (c >> 8) & 0xff;
-        img.data[i * 4 + 2] = c & 0xff;
-        img.data[i * 4 + 3] = 255;
-      }
-      pctx.putImageData(img, 0, 0);
-    }
+    drawPreview(tpl);
     }); // close requestAnimationFrame
     return () => cancelAnimationFrame(sampleRaf.current);
-  }, [imageBitmap, offX, offY, scale, gridW, gridH]);
+  }, [imageBitmap, offX, offY, scale, gridW, gridH, editing]);
   // Intentionally omitting onTemplate from deps — it's a callback prop,
   // and including it would cause infinite re-renders.
 
-  // Drag to reposition.
+  function drawPreview(tpl: number[]) {
+    const pc = previewRef.current;
+    if (!pc) return;
+    pc.width = gridW;
+    pc.height = gridH;
+    const pctx = pc.getContext("2d")!;
+    const img = pctx.createImageData(gridW, gridH);
+    for (let i = 0; i < tpl.length; i++) {
+      const c = tpl[i];
+      img.data[i * 4 + 0] = (c >> 16) & 0xff;
+      img.data[i * 4 + 1] = (c >> 8) & 0xff;
+      img.data[i * 4 + 2] = c & 0xff;
+      img.data[i * 4 + 3] = 255;
+    }
+    pctx.putImageData(img, 0, 0);
+  }
+
+  // ── Pixel editing ──
+
+  /** Convert a pointer event on the container to grid (gx, gy). */
+  function pointerToCell(e: React.PointerEvent | React.MouseEvent): [number, number] | null {
+    const el = containerRef.current;
+    if (!el) return null;
+    const rect = el.getBoundingClientRect();
+    const px = e.clientX - rect.left;
+    const py = e.clientY - rect.top;
+    const cPx = rect.width / gridW;
+    const gx = Math.floor(px / cPx);
+    const gy = Math.floor(py / cPx);
+    if (gx < 0 || gx >= gridW || gy < 0 || gy >= gridH) return null;
+    return [gx, gy];
+  }
+
+  function paintPixel(gx: number, gy: number) {
+    const tpl = tplRef.current;
+    if (!tpl) return;
+    const idx = gy * gridW + gx;
+    if (idx < 0 || idx >= tpl.length) return;
+    tpl[idx] = paintColor;
+    onTemplate([...tpl]);
+    drawPreview(tpl);
+  }
+
+  const paintingRef = useRef(false);
+
+  function onEditPointerDown(e: React.PointerEvent) {
+    if (!editing || !tplRef.current) return;
+    e.preventDefault();
+    (e.target as HTMLElement).setPointerCapture(e.pointerId);
+    paintingRef.current = true;
+    const cell = pointerToCell(e);
+    if (cell) paintPixel(cell[0], cell[1]);
+  }
+
+  function onEditPointerMove(e: React.PointerEvent) {
+    if (!editing || !paintingRef.current) return;
+    const cell = pointerToCell(e);
+    if (cell) paintPixel(cell[0], cell[1]);
+  }
+
+  function onEditPointerUp() {
+    paintingRef.current = false;
+  }
+
+  // Eyedropper: right-click in edit mode picks color from that pixel.
+  function onEditContextMenu(e: React.MouseEvent) {
+    if (!editing || !tplRef.current) return;
+    e.preventDefault();
+    const cell = pointerToCell(e);
+    if (!cell) return;
+    const idx = cell[1] * gridW + cell[0];
+    if (idx >= 0 && idx < tplRef.current.length) {
+      setPaintColor(tplRef.current[idx]);
+    }
+  }
+
+  // Drag to reposition (only in crop mode, not edit mode).
   const dragRef = useRef<{ startX: number; startY: number; ox: number; oy: number } | null>(null);
 
   function onPointerDown(e: React.PointerEvent) {
+    if (editing) return onEditPointerDown(e);
     if (!imageBitmap) return;
     e.preventDefault();
     (e.target as HTMLElement).setPointerCapture(e.pointerId);
     dragRef.current = { startX: e.clientX, startY: e.clientY, ox: offX, oy: offY };
   }
   function onPointerMove(e: React.PointerEvent) {
+    if (editing) return onEditPointerMove(e);
     if (!dragRef.current || !containerRef.current) return;
     const rect = containerRef.current.getBoundingClientRect();
-    const cellPx = rect.width / gridW;
-    const dx = (e.clientX - dragRef.current.startX) / cellPx;
-    const dy = (e.clientY - dragRef.current.startY) / cellPx;
+    const cPx = rect.width / gridW;
+    const dx = (e.clientX - dragRef.current.startX) / cPx;
+    const dy = (e.clientY - dragRef.current.startY) / cPx;
     setOffX(dragRef.current.ox + dx);
     setOffY(dragRef.current.oy + dy);
   }
   function onPointerUp() {
+    if (editing) return onEditPointerUp();
     dragRef.current = null;
   }
 
-  // Scroll to resize.
+  // Scroll to resize (disabled in edit mode).
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
     function onWheel(e: WheelEvent) {
-      if (!imageBitmap) return;
+      if (!imageBitmap || editing) return;
       e.preventDefault();
       const factor = e.deltaY < 0 ? 1.1 : 1 / 1.1;
       setScale((s) => Math.max(1, Math.min(gridW * 10, s * factor)));
     }
     el.addEventListener("wheel", onWheel, { passive: false });
     return () => el.removeEventListener("wheel", onWheel);
-  }, [imageBitmap, gridW]);
+  }, [imageBitmap, gridW, editing]);
 
   function handleFile(file: File) {
     if (file.type.startsWith("image/")) loadImage(file);
@@ -253,6 +336,8 @@ export default function MissionImageCrop({
     srcCanvasRef.current = null;
     srcCtxRef.current = null;
     srcDataRef.current = null;
+    tplRef.current = null;
+    setEditing(false);
     onTemplate(null);
   }
 
@@ -276,6 +361,7 @@ export default function MissionImageCrop({
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
         onPointerUp={onPointerUp}
+        onContextMenu={onEditContextMenu}
         onDragOver={(e) => { e.preventDefault(); }}
         onDrop={(e) => {
           e.preventDefault();
@@ -287,10 +373,10 @@ export default function MissionImageCrop({
           width: DISPLAY_W,
           height: DISPLAY_H,
           overflow: "hidden",
-          border: `2px dashed ${imageBitmap ? accent : border}`,
+          border: `2px ${editing ? "solid" : "dashed"} ${imageBitmap ? (editing ? "#ff4500" : accent) : border}`,
           borderRadius: 8,
           background: "#0a0a0e",
-          cursor: imageBitmap ? "grab" : "pointer",
+          cursor: editing ? "crosshair" : (imageBitmap ? "grab" : "pointer"),
           touchAction: "none",
           userSelect: "none",
         }}
@@ -360,8 +446,25 @@ export default function MissionImageCrop({
       {imageBitmap && (
         <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6 }}>
           <span style={{ fontSize: 10, color: textDim, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-            {fileName} · drag to move · scroll to resize
+            {editing
+              ? "click to paint · right-click to pick color"
+              : `${fileName} · drag to move · scroll to resize`}
           </span>
+          <button
+            onClick={(e) => { e.stopPropagation(); setEditing(!editing); }}
+            style={{
+              background: editing ? "#ff4500" : "none",
+              border: `1px solid ${editing ? "#ff4500" : border}`,
+              borderRadius: 4,
+              color: editing ? "#fff" : textDim,
+              fontSize: 10,
+              padding: "2px 6px",
+              cursor: "pointer",
+              flexShrink: 0,
+            }}
+          >
+            {editing ? "done" : "edit"}
+          </button>
           <button
             onClick={(e) => { e.stopPropagation(); clear(); }}
             style={{
@@ -374,6 +477,31 @@ export default function MissionImageCrop({
           </button>
         </div>
       )}
+
+      {/* Palette — shown in edit mode */}
+      {imageBitmap && editing && (
+        <div style={{
+          display: "flex", flexWrap: "wrap", gap: 2, marginTop: 6,
+          maxWidth: DISPLAY_W,
+        }}>
+          {PALETTE_HEX.map((c) => (
+            <div
+              key={c}
+              onClick={() => setPaintColor(c)}
+              style={{
+                width: 14,
+                height: 14,
+                borderRadius: 2,
+                background: hexStr(c),
+                border: c === paintColor ? "2px solid #fff" : "1px solid rgba(255,255,255,0.15)",
+                cursor: "pointer",
+                boxSizing: "border-box",
+              }}
+            />
+          ))}
+        </div>
+      )}
+
       {!imageBitmap && (
         <div style={{ fontSize: 10, color: textMuted, marginTop: 4, textAlign: "center" }}>
           tip: use pixel-art sized images for best results

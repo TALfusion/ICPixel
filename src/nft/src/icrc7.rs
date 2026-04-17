@@ -27,7 +27,10 @@ pub fn logo() -> Option<String> {
 }
 
 pub fn total_supply() -> candid::Nat {
-    TOKENS.with(|t| candid::Nat::from(t.borrow().len()))
+    TOKENS.with(|t| {
+        let count = t.borrow().iter().filter(|(_, tok)| tok.owner.is_some()).count();
+        candid::Nat::from(count as u64)
+    })
 }
 
 pub fn supply_cap() -> Option<candid::Nat> {
@@ -66,6 +69,7 @@ pub fn collection_metadata() -> Vec<(String, Value)> {
 }
 
 pub fn owner_of(ids: Vec<TokenId>) -> Vec<Option<Account>> {
+    let ids = &ids[..ids.len().min(100)];
     TOKENS.with(|t| {
         let map = t.borrow();
         ids.iter()
@@ -75,6 +79,7 @@ pub fn owner_of(ids: Vec<TokenId>) -> Vec<Option<Account>> {
 }
 
 pub fn balance_of(accounts: Vec<Account>) -> Vec<candid::Nat> {
+    let accounts = &accounts[..accounts.len().min(100)];
     TOKENS.with(|t| {
         let map = t.borrow();
         accounts
@@ -99,6 +104,7 @@ pub fn tokens(prev: Option<TokenId>, take: Option<candid::Nat>) -> Vec<TokenId> 
         let map = t.borrow();
         let start_after = prev.unwrap_or(0);
         map.iter()
+            .filter(|(_, tok)| tok.owner.is_some())
             .map(|(id, _)| id)
             .filter(|id| *id > start_after)
             .take(take_n)
@@ -130,6 +136,7 @@ pub fn tokens_of(
 /// Returns the metadata fields as ICRC-7 record entries. Burned tokens still
 /// return their metadata (history is preserved).
 pub fn token_metadata(ids: Vec<TokenId>) -> Vec<Option<Vec<(String, Value)>>> {
+    let ids = &ids[..ids.len().min(100)];
     TOKENS.with(|t| {
         let map = t.borrow();
         ids.iter()
@@ -171,15 +178,14 @@ fn metadata_to_pairs(m: &TokenMetadata) -> Vec<(String, Value)> {
             "icpixel:height".into(),
             Value::Nat(candid::Nat::from(m.height as u64)),
         ),
-        ("icpixel:x".into(), Value::Int(candid::Int::from(m.x as i64))),
-        ("icpixel:y".into(), Value::Int(candid::Int::from(m.y as i64))),
+        // `icpixel:x`, `icpixel:y` and `icpixel:match_percent` were
+        // previously emitted here. Removed from the public metadata
+        // surface — the fields stay in the stored struct for backward
+        // compat with already-minted tokens, but marketplaces and the
+        // in-app gallery no longer see them.
         (
             "icpixel:completed_at".into(),
             Value::Nat(candid::Nat::from(m.completed_at)),
-        ),
-        (
-            "icpixel:match_percent".into(),
-            Value::Nat(candid::Nat::from(m.match_percent as u64)),
         ),
     ]
 }
@@ -219,8 +225,7 @@ pub fn list_season_tokens(
     })
 }
 
-/// ICRC-7 transfer. We don't track approvals, only direct transfer by the
-/// current owner. No transaction log is kept (we always return index 0).
+/// ICRC-7 transfer with ICRC-3 transaction logging.
 pub fn transfer(caller: candid::Principal, args: Vec<TransferArg>) -> Vec<Option<TransferResult>> {
     args.into_iter()
         .map(|arg| Some(transfer_one(caller, arg)))
@@ -228,6 +233,14 @@ pub fn transfer(caller: candid::Principal, args: Vec<TransferArg>) -> Vec<Option
 }
 
 fn transfer_one(caller: candid::Principal, arg: TransferArg) -> TransferResult {
+    if let Some(ref memo) = arg.memo {
+        if memo.len() > 32 {
+            return TransferResult::Err(TransferError::GenericError {
+                error_code: 1,
+                message: "memo exceeds max_memo_size of 32 bytes".into(),
+            });
+        }
+    }
     let result = TOKENS.with(|t| {
         let mut map = t.borrow_mut();
         let mut tok = match map.get(&arg.token_id) {
@@ -236,24 +249,32 @@ fn transfer_one(caller: candid::Principal, arg: TransferArg) -> TransferResult {
         };
         let owner = match &tok.owner {
             Some(o) => o.clone(),
-            None => return Err(TransferError::Unauthorized), // burned token
+            None => return Err(TransferError::Unauthorized),
         };
-        // Caller must be the principal in the owner account, and (if from_subaccount
-        // was supplied) the subaccount must match.
         if owner.owner != caller {
             return Err(TransferError::Unauthorized);
         }
-        if let Some(sub) = arg.from_subaccount {
-            if owner.subaccount != Some(sub) {
-                return Err(TransferError::Unauthorized);
-            }
+        let caller_sub = arg.from_subaccount.unwrap_or([0u8; 32]);
+        let owner_sub = owner.subaccount.unwrap_or([0u8; 32]);
+        if caller_sub != owner_sub {
+            return Err(TransferError::Unauthorized);
         }
-        tok.owner = Some(arg.to);
+        tok.owner = Some(arg.to.clone());
         map.insert(arg.token_id, tok);
-        Ok(())
+        Ok((owner, arg.to.clone()))
     });
     match result {
-        Ok(()) => TransferResult::Ok(0),
+        Ok((from, to)) => {
+            let idx = crate::state::log_tx(crate::types::TxRecord {
+                kind: crate::types::TxKind::Transfer,
+                timestamp: ic_cdk::api::time(),
+                token_id: arg.token_id,
+                from: Some(from),
+                to: Some(to),
+                memo: arg.memo.map(|m| serde_bytes::ByteBuf::from(m.to_vec())),
+            });
+            TransferResult::Ok(idx)
+        }
         Err(e) => TransferResult::Err(e),
     }
 }

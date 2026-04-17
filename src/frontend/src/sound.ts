@@ -42,6 +42,22 @@ export function unlockAudio() {
   if (c && c.state === "suspended") c.resume().catch(() => {});
 }
 
+/// Auto-unlock on very first user interaction (click, touch, keydown).
+/// Called once from a one-shot listener — after the first successful resume
+/// the context stays "running" for the lifetime of the page, so subsequent
+/// `playPlacePixel()` calls that happen after an `await` still produce sound.
+if (typeof document !== "undefined") {
+  const earlyUnlock = () => {
+    unlockAudio();
+    document.removeEventListener("click", earlyUnlock, true);
+    document.removeEventListener("touchstart", earlyUnlock, true);
+    document.removeEventListener("keydown", earlyUnlock, true);
+  };
+  document.addEventListener("click", earlyUnlock, true);
+  document.addEventListener("touchstart", earlyUnlock, true);
+  document.addEventListener("keydown", earlyUnlock, true);
+}
+
 // ── Primitives ────────────────────────────────────────────────────────
 function tone(opts: {
   freq: number;

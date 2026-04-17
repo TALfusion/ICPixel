@@ -237,13 +237,17 @@ async fn icrc1_transfer_from_subaccount_explicit(
 /// public entry points wrap this with retry-on-BadFee logic.
 async fn icrc1_transfer_explicit(
     ledger: Principal,
-    to: Principal,
+    to_owner: Principal,
+    to_subaccount: Option<[u8; 32]>,
     amount: u64,
     fee: u64,
 ) -> Result<Result<u64, TransferError>, String> {
     let arg = TransferArg {
         from_subaccount: None,
-        to: Account { owner: to, subaccount: None },
+        to: Account {
+            owner: to_owner,
+            subaccount: to_subaccount.map(|s| serde_bytes::ByteBuf::from(s.to_vec())),
+        },
         amount: Nat::from(amount),
         fee: Some(Nat::from(fee)),
         memo: None,
@@ -253,6 +257,88 @@ async fn icrc1_transfer_explicit(
         .await
         .map_err(|(code, msg)| format!("ledger icrc1_transfer: {code:?} {msg}"))?;
     Ok(res.map(|n| nat_to_u64(&n)))
+}
+
+// ───── Legacy ICP ledger `transfer` (AccountIdentifier destination) ─────
+
+#[derive(CandidType, Deserialize, Serialize, Clone, Debug)]
+struct LegacyTokens {
+    e8s: u64,
+}
+
+#[derive(CandidType, Deserialize, Serialize, Clone, Debug)]
+struct LegacyTimeStamp {
+    timestamp_nanos: u64,
+}
+
+#[derive(CandidType, Deserialize, Serialize, Clone, Debug)]
+struct LegacyTransferArgs {
+    memo: u64,
+    amount: LegacyTokens,
+    fee: LegacyTokens,
+    from_subaccount: Option<serde_bytes::ByteBuf>,
+    to: serde_bytes::ByteBuf, // 32-byte AccountIdentifier
+    created_at_time: Option<LegacyTimeStamp>,
+}
+
+#[derive(CandidType, Deserialize, Debug)]
+enum LegacyTransferError {
+    BadFee { expected_fee: LegacyTokens },
+    InsufficientFunds { balance: LegacyTokens },
+    TxTooOld { allowed_window_nanos: u64 },
+    TxCreatedInFuture,
+    TxDuplicate { duplicate_of: u64 },
+}
+
+async fn legacy_transfer_explicit(
+    ledger: Principal,
+    to_account_id: [u8; 32],
+    amount: u64,
+    fee: u64,
+) -> Result<Result<u64, LegacyTransferError>, String> {
+    let arg = LegacyTransferArgs {
+        memo: 0,
+        amount: LegacyTokens { e8s: amount },
+        fee: LegacyTokens { e8s: fee },
+        from_subaccount: None,
+        to: serde_bytes::ByteBuf::from(to_account_id.to_vec()),
+        created_at_time: None,
+    };
+    let (res,): (Result<u64, LegacyTransferError>,) = ic_cdk::call(ledger, "transfer", (arg,))
+        .await
+        .map_err(|(code, msg)| format!("ledger transfer: {code:?} {msg}"))?;
+    Ok(res)
+}
+
+/// Destination for a canister → external payout. Mirrors the three
+/// address formats we show on the deposit side: AccountId for
+/// NNS / exchanges, Icrc1 for modern wallets. Used by claim flows so
+/// rewards can land directly where the player wants them, rather than
+/// always routing through the caller's II default account.
+#[derive(candid::CandidType, serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub enum PayoutDest {
+    /// Legacy 32-byte account identifier (hex-decoded on caller side).
+    AccountId(serde_bytes::ByteBuf),
+    /// ICRC-1 destination.
+    Icrc1 {
+        owner: Principal,
+        subaccount: Option<serde_bytes::ByteBuf>,
+    },
+}
+
+impl PayoutDest {
+    /// Convert the frontend-friendly inputs into a validated `PayoutDest`.
+    /// `account_id_hex` must be exactly 64 hex chars (32 bytes) if given.
+    /// `subaccount_hex` must be exactly 64 hex chars if given.
+    pub fn from_icrc1(owner: Principal, subaccount_bytes: Option<[u8; 32]>) -> Self {
+        PayoutDest::Icrc1 {
+            owner,
+            subaccount: subaccount_bytes.map(|s| serde_bytes::ByteBuf::from(s.to_vec())),
+        }
+    }
+    pub fn from_account_id(bytes: [u8; 32]) -> Self {
+        PayoutDest::AccountId(serde_bytes::ByteBuf::from(bytes.to_vec()))
+    }
 }
 
 /// Drain pattern: caller supplies the **total** amount they have available
@@ -269,9 +355,28 @@ pub async fn transfer_drain(
     to: Principal,
     total_available: u64,
 ) -> Result<u64, String> {
+    drain_to_dest(
+        ledger,
+        &PayoutDest::Icrc1 { owner: to, subaccount: None },
+        total_available,
+    )
+    .await
+    .map(|(amount, _idx)| amount)
+}
+
+/// Drain pattern with a user-chosen destination format. Routes through
+/// either `icrc1_transfer` (for ICRC-1 destinations) or the legacy
+/// `transfer` method (for 32-byte AccountIdentifier destinations).
+///
+/// Returns `(net_amount, block_index)` on success. The block index lets
+/// callers surface an explorer link to the user.
+pub async fn drain_to_dest(
+    ledger: Principal,
+    dest: &PayoutDest,
+    total_available: u64,
+) -> Result<(u64, u64), String> {
     let fee = cached_ledger_fee();
     if total_available <= fee {
-        // Cache might be stale-too-high. Try a fresh fetch before bailing.
         let fresh = refresh_ledger_fee(ledger).await.unwrap_or(fee);
         if total_available <= fresh {
             return Err(format!(
@@ -279,16 +384,18 @@ pub async fn transfer_drain(
             ));
         }
         let amount = total_available - fresh;
-        match icrc1_transfer_explicit(ledger, to, amount, fresh).await? {
-            Ok(_) => return Ok(amount),
-            Err(e) => return Err(format!("icrc1_transfer rejected: {e:?}")),
-        }
+        return run_transfer(ledger, dest, amount, fresh)
+            .await
+            .map(|idx| (amount, idx))
+            .map_err(|e| match e {
+                TransferAny::BadFee(_) => "ledger fee mismatch on fresh fetch".into(),
+                TransferAny::Other(s) => s,
+            });
     }
     let amount = total_available - fee;
-    match icrc1_transfer_explicit(ledger, to, amount, fee).await? {
-        Ok(_) => Ok(amount),
-        Err(TransferError::BadFee { expected_fee }) => {
-            let new_fee = nat_to_u64(&expected_fee);
+    match run_transfer(ledger, dest, amount, fee).await {
+        Ok(idx) => Ok((amount, idx)),
+        Err(TransferAny::BadFee(new_fee)) => {
             set_ledger_fee(new_fee);
             if total_available <= new_fee {
                 return Err(format!(
@@ -296,11 +403,75 @@ pub async fn transfer_drain(
                 ));
             }
             let amount = total_available - new_fee;
-            match icrc1_transfer_explicit(ledger, to, amount, new_fee).await? {
-                Ok(_) => Ok(amount),
-                Err(e) => Err(format!("icrc1_transfer rejected after fee refresh: {e:?}")),
-            }
+            run_transfer(ledger, dest, amount, new_fee)
+                .await
+                .map(|idx| (amount, idx))
+                .map_err(|e| match e {
+                    TransferAny::BadFee(_) => "ledger fee flipped twice in a row".into(),
+                    TransferAny::Other(s) => s,
+                })
         }
-        Err(e) => Err(format!("icrc1_transfer rejected: {e:?}")),
+        Err(TransferAny::Other(s)) => Err(s),
     }
 }
+
+/// Narrow error type for the single-attempt path so `drain_to_dest` can
+/// distinguish `BadFee` (retry-worthy) from terminal failures.
+enum TransferAny {
+    BadFee(u64),
+    Other(String),
+}
+
+async fn run_transfer(
+    ledger: Principal,
+    dest: &PayoutDest,
+    amount: u64,
+    fee: u64,
+) -> Result<u64, TransferAny> {
+    match dest {
+        PayoutDest::Icrc1 { owner, subaccount } => {
+            let sub_bytes: Option<[u8; 32]> = subaccount.as_ref().and_then(|b| {
+                if b.len() == 32 {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(b);
+                    Some(arr)
+                } else {
+                    None
+                }
+            });
+            let res = icrc1_transfer_explicit(ledger, *owner, sub_bytes, amount, fee)
+                .await
+                .map_err(TransferAny::Other)?;
+            match res {
+                Ok(idx) => Ok(idx),
+                Err(TransferError::BadFee { expected_fee }) => {
+                    Err(TransferAny::BadFee(nat_to_u64(&expected_fee)))
+                }
+                Err(e) => Err(TransferAny::Other(format!("icrc1_transfer rejected: {e:?}"))),
+            }
+        }
+        PayoutDest::AccountId(bytes) => {
+            if bytes.len() != 32 {
+                return Err(TransferAny::Other(format!(
+                    "account_id must be 32 bytes, got {}",
+                    bytes.len()
+                )));
+            }
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(bytes);
+            let res = legacy_transfer_explicit(ledger, arr, amount, fee)
+                .await
+                .map_err(TransferAny::Other)?;
+            match res {
+                Ok(idx) => Ok(idx),
+                Err(LegacyTransferError::BadFee { expected_fee }) => {
+                    Err(TransferAny::BadFee(expected_fee.e8s))
+                }
+                Err(e) => Err(TransferAny::Other(format!(
+                    "legacy transfer rejected: {e:?}"
+                ))),
+            }
+        }
+    }
+}
+

@@ -116,7 +116,7 @@ pub enum TransferError {
 
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
 pub enum TransferResult {
-    Ok(u64), // transaction index — we always return 0 since we don't keep a log
+    Ok(u64), // ICRC-3 transaction index
     Err(TransferError),
 }
 
@@ -139,6 +139,65 @@ pub enum Value {
     Int(candid::Int),
     Text(String),
     Blob(serde_bytes::ByteBuf),
+}
+
+// ───── ICRC-3 transaction log ─────
+
+/// Type of transaction logged in the ICRC-3 ledger.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
+pub enum TxKind {
+    Mint,
+    Transfer,
+    Burn,
+}
+
+/// Single ICRC-3 transaction record. Stored in `TX_LOG` stable map.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
+pub struct TxRecord {
+    pub kind: TxKind,
+    pub timestamp: u64,
+    pub token_id: TokenId,
+    pub from: Option<Account>,
+    pub to: Option<Account>,
+    pub memo: Option<serde_bytes::ByteBuf>,
+}
+
+impl ic_stable_structures::Storable for TxRecord {
+    fn to_bytes(&self) -> std::borrow::Cow<'_, [u8]> {
+        std::borrow::Cow::Owned(candid::encode_one(self).expect("encode TxRecord"))
+    }
+    fn from_bytes(bytes: std::borrow::Cow<[u8]>) -> Self {
+        candid::decode_one(&bytes).expect("decode TxRecord")
+    }
+    const BOUND: ic_stable_structures::storable::Bound =
+        ic_stable_structures::storable::Bound::Bounded {
+            max_size: 1024,
+            is_fixed_size: false,
+        };
+}
+
+/// ICRC-3 `GetTransactionsResponse` block.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
+pub struct Icrc3Transaction {
+    pub id: u64,
+    pub kind: TxKind,
+    pub timestamp: u64,
+    pub token_id: TokenId,
+    pub from: Option<Account>,
+    pub to: Option<Account>,
+    pub memo: Option<serde_bytes::ByteBuf>,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
+pub struct GetTransactionsResponse {
+    pub log_length: u64,
+    pub transactions: Vec<Icrc3Transaction>,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
+pub struct SupportedBlockType {
+    pub block_type: String,
+    pub url: String,
 }
 
 // ───── http_request types (ic-cdk style) ─────

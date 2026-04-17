@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState, useCallback, type CSSProperties } from "react";
+import React, { useEffect, useRef, useState, useCallback, type CSSProperties } from "react";
+import { Principal } from "@dfinity/principal";
 import type {
   Alliance,
   AlliancePublic,
@@ -9,7 +10,123 @@ import type {
   MissionRoundPublic,
   MissionContributionView,
 } from "./idl";
+import { makeNftActor, getAuthClient } from "./api";
 import MissionImageCrop from "./MissionImageCrop";
+
+// ── Payout destination picker (shared by claim flows) ──────────────
+// Mirrors the three address formats on the deposit side so players can
+// receive rewards at any wallet they control, not just their II default.
+type PayoutFormat = "default" | "account_id" | "principal" | "icrc1";
+
+/// Explorer link for an ICP ledger block (mission rewards, treasury claims).
+/// Uses the public IC dashboard. Returns "" if index is missing.
+function explorerTxUrl(blockIndex: bigint | null | undefined): string {
+  if (blockIndex == null) return "";
+  return `https://dashboard.internetcomputer.org/transaction/${blockIndex}`;
+}
+
+/// Explorer link for an NFT token (ICRC-7) on our NFT canister.
+function explorerNftUrl(tokenId: bigint | null | undefined): string {
+  if (tokenId == null) return "";
+  return `https://dashboard.internetcomputer.org/canister/dtki7-2aaaa-aaaai-axpaq-cai`;
+}
+
+/// Render a status message, turning any http(s):// URLs inside it into
+/// clickable external links. Used for the "sent successfully — View on
+/// explorer: <url>" pattern so the explorer opens in a new tab.
+function renderMsgWithLinks(msg: string): React.ReactNode {
+  const parts = msg.split(/(https?:\/\/\S+)/g);
+  return parts.map((p, i) => {
+    if (/^https?:\/\//.test(p)) {
+      return (
+        <a
+          key={i}
+          href={p}
+          target="_blank"
+          rel="noopener noreferrer"
+          style={{ color: "#5fa8ff", textDecoration: "underline" }}
+        >
+          {p}
+        </a>
+      );
+    }
+    return <span key={i}>{p}</span>;
+  });
+}
+
+/// Translate raw backend / wallet error strings into short human-readable
+/// messages. Same scope as the humanizer in App.tsx; duplicated here so
+/// AlliancePanel doesn't depend on internal App exports.
+function humanizeError(raw: string, fallback = "Something went wrong — please try again"): string {
+  const s = raw.toLowerCase();
+  if (s.includes("anonymous") || s.includes("login required") || s.includes("unauthorized")) return "Please sign in first";
+  if (s.includes("ledger not configured")) return "Payments are not configured yet — please contact support";
+  if (s.includes("not leader")) return "Only the alliance leader can do that";
+  if (s.includes("mission not complete")) return "The mission isn't complete yet";
+  if (s.includes("nothing to claim")) return "Nothing to claim yet";
+  if (s.includes("alreadyclaimed") || s.includes("already claimed")) return "You've already claimed this round";
+  if (s.includes("nocontribution") || s.includes("no contribution")) return "You have no contribution in this round";
+  if (s.includes("roundnotcompleted") || s.includes("round not completed")) return "This round isn't completed yet";
+  if (s.includes("roundnotfound") || s.includes("round not found")) return "Round not found";
+  if (s.includes("paymentfailed") || s.includes("payment failed")) return "Payment failed — please try again";
+  if (s.includes("insufficientfunds")) return "Insufficient ICP balance";
+  if (s.includes("temporarilyunavailable")) return "ICP ledger is temporarily unavailable — try again in a moment";
+  if (s.includes("badfee")) return "Ledger fee changed — please retry";
+  if (s.includes("too old") || s.includes("tooold")) return "Request timed out — please retry";
+  if (s.includes("nonexisting") || s.includes("nonexistingtoken")) return "This NFT doesn't exist anymore";
+  if (s.includes("invalidrecipient")) return "Invalid recipient";
+  if (s.includes("duplicate")) return "Duplicate transfer — already processed";
+  if (s.includes("bad hex")) return "Invalid address format";
+  if (s.includes("does not cover ledger fee")) return "Amount too small to cover the network fee";
+  return fallback;
+}
+
+function buildPayoutDest(
+  format: PayoutFormat,
+  addressInput: string,
+  subaccountInput: string
+): { ok: unknown } | { err: string } {
+  const a = addressInput.trim();
+  const s = subaccountInput.trim();
+  switch (format) {
+    case "default":
+      return { ok: { Default: null } };
+    case "account_id": {
+      if (!/^[0-9a-fA-F]{64}$/.test(a)) {
+        return { err: "Account ID must be 64 hex characters" };
+      }
+      return { ok: { AccountId: { hex: a.toLowerCase() } } };
+    }
+    case "principal": {
+      let p: Principal;
+      try {
+        p = Principal.fromText(a);
+      } catch {
+        return { err: "Invalid principal" };
+      }
+      return { ok: { Icrc1: { owner: p, subaccount_hex: [] } } };
+    }
+    case "icrc1": {
+      let p: Principal;
+      try {
+        p = Principal.fromText(a);
+      } catch {
+        return { err: "Invalid principal" };
+      }
+      if (s && !/^[0-9a-fA-F]{64}$/.test(s)) {
+        return { err: "Subaccount must be 64 hex characters (or empty)" };
+      }
+      return {
+        ok: {
+          Icrc1: {
+            owner: p,
+            subaccount_hex: s ? [s.toLowerCase()] : [],
+          },
+        },
+      };
+    }
+  }
+}
 
 type PanelTab = "mine" | "leaderboard";
 
@@ -280,7 +397,7 @@ const _network = import.meta.env.VITE_DFX_NETWORK as string || "local";
 function nftImageUrl(token_id: bigint): string {
   if (!_nftId) return "#";
   return _network === "ic"
-    ? `https://${_nftId}.icp0.io/token/${token_id}.png`
+    ? `https://${_nftId}.raw.icp0.io/token/${token_id}.png`
     : `http://${_nftId}.localhost:4943/token/${token_id}.png`;
 }
 
@@ -387,27 +504,62 @@ function RewardsPanel({
     };
   }, [actor, allianceId, tick]);
 
-  async function claim(roundIndex: number) {
+  // Destination-picker state for the claim modal. `claimRound !== null`
+  // is the "modal is open" signal.
+  const [claimRound, setClaimRound] = useState<number | null>(null);
+  const [claimFormat, setClaimFormat] = useState<PayoutFormat>(() => {
+    const saved = typeof window !== "undefined" ? localStorage.getItem("icpixel.claimFormat") : null;
+    if (saved === "account_id" || saved === "principal" || saved === "icrc1") return saved;
+    return "default";
+  });
+  const [claimAddr, setClaimAddr] = useState("");
+  const [claimSub, setClaimSub] = useState("");
+
+  function pickClaimFormat(f: PayoutFormat) {
+    setClaimFormat(f);
+    try { localStorage.setItem("icpixel.claimFormat", f); } catch {}
+  }
+
+  async function runClaim(roundIndex: number) {
+    const built = buildPayoutDest(claimFormat, claimAddr, claimSub);
+    if ("err" in built) {
+      setMsg(built.err);
+      return;
+    }
     setBusy(roundIndex);
     setMsg(null);
     try {
-      const res = await actor.claim_mission_reward(allianceId, roundIndex);
+      const res = await actor.claim_mission_reward(
+        allianceId,
+        roundIndex,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        built.ok as any
+      );
       if ("Ok" in res) {
-        setMsg(
-          res.Ok.share_e8s === 0n
-            ? "claimed (0 ICP — pool empty in free mode)"
-            : `claimed ${fmtIcp(res.Ok.share_e8s)} ICP`,
-        );
-        // Force a refresh by re-pulling the contribution for that round.
+        const share = res.Ok.share_e8s;
+        const blockOpt = res.Ok.block_index;
+        const block = blockOpt && blockOpt.length > 0 ? blockOpt[0] : null;
+        if (share === 0n) {
+          setMsg("Claimed (0 ICP — pool is empty)");
+        } else if (block != null) {
+          const url = explorerTxUrl(block);
+          setMsg(
+            `✓ Sent successfully — ${fmtIcp(share)} ICP on its way. ` +
+            `View on explorer: ${url}`
+          );
+        } else {
+          setMsg(`✓ Sent successfully — ${fmtIcp(share)} ICP`);
+        }
+        setClaimRound(null);
         const fresh = await actor.my_mission_contribution(allianceId, roundIndex);
         if ("Ok" in fresh) {
           setCompletedContributions((prev) => ({ ...prev, [roundIndex]: fresh.Ok }));
         }
       } else {
-        setMsg(fmtError(res.Err));
+        setMsg(humanizeError(fmtError(res.Err), "Claim failed"));
       }
     } catch (e) {
-      setMsg(String(e));
+      setMsg(humanizeError(String(e), "Connection issue — please try again"));
     } finally {
       setBusy(null);
     }
@@ -492,7 +644,10 @@ function RewardsPanel({
                 {hasContribution && !claimed ? (
                   <button
                     disabled={busy === r.round_index}
-                    onClick={() => claim(r.round_index)}
+                    onClick={() => {
+                      setClaimRound(r.round_index);
+                      setMsg(null);
+                    }}
                     style={{
                       padding: "3px 8px",
                       fontSize: 11,
@@ -519,15 +674,189 @@ function RewardsPanel({
           style={{
             marginTop: 6,
             fontSize: 11,
-            color: msg.startsWith("claimed") ? C.green : C.textDim,
+            color: msg.startsWith("✓") ? C.green : msg.startsWith("Claimed") ? C.green : C.textDim,
           }}
         >
-          {msg}
+          {renderMsgWithLinks(msg)}
+        </div>
+      )}
+
+      {claimRound !== null && (
+        <div
+          onClick={() => { if (busy === null) setClaimRound(null); }}
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.65)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            zIndex: 100,
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              background: "#16161a",
+              border: "1px solid #2a2a32",
+              borderRadius: 10,
+              padding: 20,
+              width: 380,
+              maxWidth: "92vw",
+              color: "#e8e8ec",
+              boxShadow: "0 20px 60px rgba(0,0,0,0.6)",
+            }}
+          >
+            <div style={{ fontSize: 16, fontWeight: 800, marginBottom: 6 }}>
+              Claim reward
+            </div>
+            <div style={{ fontSize: 12, color: "#9090a0", marginBottom: 14 }}>
+              Where should we send your ICP? Leave the default to receive on
+              your Internet Identity account.
+            </div>
+
+            <div style={{ fontSize: 11, color: "#6a6a76", marginBottom: 4, fontWeight: 600 }}>
+              ADDRESS FORMAT
+            </div>
+            <select
+              value={claimFormat}
+              onChange={(e) => pickClaimFormat(e.target.value as PayoutFormat)}
+              disabled={busy !== null}
+              style={{
+                width: "100%",
+                padding: "10px 12px",
+                marginBottom: 12,
+                background: "#1f1f25",
+                color: "#e8e8ec",
+                border: "1px solid #2a2a32",
+                borderRadius: 6,
+                fontSize: 13,
+                cursor: busy !== null ? "wait" : "pointer",
+                appearance: "none",
+                WebkitAppearance: "none",
+                backgroundImage:
+                  "url(\"data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'><path fill='%239090a0' d='M6 8L0 0h12z'/></svg>\")",
+                backgroundRepeat: "no-repeat",
+                backgroundPosition: "right 12px center",
+                paddingRight: 34,
+              }}
+            >
+              <option value="default">My Internet Identity (default)</option>
+              <option value="account_id">Account ID (NNS, Coinbase, exchanges)</option>
+              <option value="principal">Principal (Plug, Oisy, NFID)</option>
+              <option value="icrc1">Principal + Subaccount (ICRC-1)</option>
+            </select>
+
+            {claimFormat === "account_id" && (
+              <>
+                <div style={{ fontSize: 11, color: "#6a6a76", marginBottom: 4, fontWeight: 600 }}>
+                  ACCOUNT ID (64 hex chars)
+                </div>
+                <input
+                  value={claimAddr}
+                  onChange={(e) => setClaimAddr(e.target.value)}
+                  placeholder="e.g. a3827007b9233c4503f31ec…"
+                  style={inputStyle}
+                  spellCheck={false}
+                />
+              </>
+            )}
+            {(claimFormat === "principal" || claimFormat === "icrc1") && (
+              <>
+                <div style={{ fontSize: 11, color: "#6a6a76", marginBottom: 4, fontWeight: 600 }}>
+                  PRINCIPAL
+                </div>
+                <input
+                  value={claimAddr}
+                  onChange={(e) => setClaimAddr(e.target.value)}
+                  placeholder="e.g. jeebz-3aaaa-aaaai-axjfa-cai"
+                  style={inputStyle}
+                  spellCheck={false}
+                />
+              </>
+            )}
+            {claimFormat === "icrc1" && (
+              <>
+                <div style={{ fontSize: 11, color: "#6a6a76", marginBottom: 4, fontWeight: 600, marginTop: 8 }}>
+                  SUBACCOUNT (optional, 64 hex chars)
+                </div>
+                <input
+                  value={claimSub}
+                  onChange={(e) => setClaimSub(e.target.value)}
+                  placeholder="leave empty for default subaccount"
+                  style={inputStyle}
+                  spellCheck={false}
+                />
+              </>
+            )}
+
+            <div
+              style={{
+                fontSize: 11,
+                color: "#f0c040",
+                background: "rgba(240,192,64,0.08)",
+                border: "1px solid rgba(240,192,64,0.3)",
+                padding: 10,
+                borderRadius: 6,
+                margin: "12px 0 14px",
+                lineHeight: 1.5,
+              }}
+            >
+              ⚠ Double-check the address — wrong destinations are not recoverable.
+            </div>
+
+            <button
+              disabled={busy !== null}
+              onClick={() => { if (claimRound !== null) runClaim(claimRound); }}
+              style={{
+                width: "100%",
+                padding: "10px",
+                background: busy !== null ? "#9090a0" : "#f0c040",
+                color: "#16161a",
+                border: "none",
+                borderRadius: 6,
+                fontSize: 14,
+                fontWeight: 800,
+                cursor: busy !== null ? "wait" : "pointer",
+                marginBottom: 8,
+              }}
+            >
+              {busy !== null ? "claiming…" : "Claim and send"}
+            </button>
+            <button
+              disabled={busy !== null}
+              onClick={() => setClaimRound(null)}
+              style={{
+                width: "100%",
+                padding: 8,
+                background: "transparent",
+                color: "#9090a0",
+                border: "1px solid #2a2a32",
+                borderRadius: 6,
+                fontSize: 12,
+                cursor: "pointer",
+              }}
+            >
+              Cancel
+            </button>
+          </div>
         </div>
       )}
     </div>
   );
 }
+
+const inputStyle: CSSProperties = {
+  width: "100%",
+  padding: "10px 12px",
+  background: "#1b1b22",
+  color: "#c8c8d0",
+  border: "1px solid #2a2a32",
+  borderRadius: 6,
+  fontSize: 11,
+  fontFamily: "ui-monospace, monospace",
+  boxSizing: "border-box",
+};
 
 // Palette + image-to-template conversion moved into MissionImageCrop.
 
@@ -633,19 +962,138 @@ export default function AlliancePanel({
 }: Props) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  // NFT transfer modal state — opens when the leader clicks "transfer"
+  // next to a minted NFT. ICRC-7 destinations are (owner, opt subaccount).
+  const [nftTransferToken, setNftTransferToken] = useState<bigint | null>(null);
+  const [nftFormat, setNftFormat] = useState<"principal" | "icrc1">(() => {
+    const saved = typeof window !== "undefined" ? localStorage.getItem("icpixel.nftFormat") : null;
+    if (saved === "icrc1") return "icrc1";
+    return "principal";
+  });
+  const [nftAddr, setNftAddr] = useState("");
+  const [nftSub, setNftSub] = useState("");
+  const [nftBusy, setNftBusy] = useState(false);
+
+  function pickNftFormat(f: "principal" | "icrc1") {
+    setNftFormat(f);
+    try { localStorage.setItem("icpixel.nftFormat", f); } catch {}
+  }
+
+  async function runNftTransfer(tokenId: bigint) {
+    const a = nftAddr.trim();
+    const s = nftSub.trim();
+    if (!a) {
+      setErr("Enter the destination principal");
+      return;
+    }
+    let toAccount: { owner: Principal; subaccount: [] | [Uint8Array] };
+    try {
+      const owner = Principal.fromText(a);
+      if (nftFormat === "icrc1" && s) {
+        if (!/^[0-9a-fA-F]{64}$/.test(s)) {
+          setErr("Subaccount must be 64 hex characters (or empty)");
+          return;
+        }
+        const bytes = new Uint8Array(32);
+        for (let i = 0; i < 32; i++) bytes[i] = parseInt(s.slice(i * 2, i * 2 + 2), 16);
+        toAccount = { owner, subaccount: [bytes] };
+      } else {
+        toAccount = { owner, subaccount: [] };
+      }
+    } catch {
+      setErr("Invalid principal");
+      return;
+    }
+    setNftBusy(true);
+    setErr(null);
+    try {
+      const identity = (await getAuthClient()).getIdentity();
+      const callerP = identity.getPrincipal().toString();
+      const ownerP = myAlliance?.leader?.toString() ?? "?";
+      console.log("[nft-transfer] caller principal:", callerP, "| NFT owner (leader):", ownerP);
+      if (callerP !== ownerP) {
+        setErr(`Principal mismatch — you're signed in as ${callerP.slice(0, 10)}… but NFT belongs to ${ownerP.slice(0, 10)}…`);
+        setNftBusy(false);
+        return;
+      }
+      const nft = await makeNftActor(identity);
+      const res = await nft.icrc7_transfer([{
+        to: toAccount,
+        token_id: tokenId,
+        memo: [],
+        from_subaccount: [],
+        created_at_time: [],
+      }]);
+      const slot = res[0];
+      if (!slot || slot.length === 0) {
+        setErr("Transfer returned no result — please retry");
+        return;
+      }
+      const r = slot[0]!;
+      if ("Ok" in r) {
+        const url = explorerNftUrl(tokenId);
+        setErr(null);
+        setNftTransferToken(null);
+        setNftSuccess(
+          `✓ NFT #${tokenId} sent successfully. View on explorer: ${url}`
+        );
+      } else {
+        const errKey = Object.keys(r.Err)[0] ?? "Unknown";
+        if (errKey === "Unauthorized") {
+          // Check who actually owns the token now — might have been
+          // transferred in a previous attempt that succeeded but showed
+          // an error to the user.
+          try {
+            const owners = await nft.icrc7_owner_of([tokenId]);
+            const actual = owners?.[0]?.[0];
+            if (actual && actual.owner.toString() !== callerP) {
+              setErr(
+                `This NFT was already transferred to ${actual.owner.toString().slice(0, 15)}…`
+              );
+            } else {
+              setErr("You don't have permission to transfer this NFT");
+            }
+          } catch {
+            setErr("You don't have permission to transfer this NFT");
+          }
+        } else if (errKey === "NonExistingTokenId") {
+          setErr("This NFT no longer exists (burned)");
+        } else {
+          setErr(humanizeError(errKey, "NFT transfer failed"));
+        }
+      }
+    } catch (e) {
+      setErr(humanizeError(String(e), "Connection issue — please try again"));
+    } finally {
+      setNftBusy(false);
+    }
+  }
+
+  // Last NFT-transfer success message with explorer link. Separate state
+  // so a successful transfer survives the modal closing and stays visible
+  // for a moment on the panel.
+  const [nftSuccess, setNftSuccess] = useState<string | null>(null);
+  useEffect(() => {
+    if (!nftSuccess) return;
+    const t = setTimeout(() => setNftSuccess(null), 12000);
+    return () => clearTimeout(t);
+  }, [nftSuccess]);
   /// True when the leader is in the middle of upgrading the mission. The form
   /// reuses the create-alliance flow (rect + image), but on submit it calls
   /// `upgrade_mission` instead of `create_alliance` and the new rect must
   /// CONTAIN the old one.
   const [upgrading, setUpgrading] = useState(false);
-  // Alliance creation fee. Refetched on mount; cheap to call (small query).
-  const [priceE8s, setPriceE8s] = useState<bigint>(0n);
+  // Alliance creation cost in pixel credits (current + next tier).
+  const [pricePixels, setPricePixels] = useState<bigint>(0n);
+  const [nextPrice, setNextPrice] = useState<bigint | null>(null);
   useEffect(() => {
     let stop = false;
     actor
-      .get_alliance_billing()
-      .then((b: { alliance_price_e8s: bigint }) => {
-        if (!stop) setPriceE8s(b.alliance_price_e8s);
+      .get_alliance_price_pixels()
+      .then((info: { current: bigint; next: [] | [bigint] }) => {
+        if (stop) return;
+        setPricePixels(info.current);
+        setNextPrice(info.next.length > 0 ? info.next[0]! : null);
       })
       .catch(() => {});
     return () => {
@@ -738,8 +1186,9 @@ export default function AlliancePanel({
       !busy &&
       !!name.trim() &&
       !!pendingRect &&
-      pendingRect.width >= 5 &&
-      pendingRect.height >= 5 &&
+      pendingRect.width >= 3 &&
+      pendingRect.height >= 3 &&
+      pendingRect.width * pendingRect.height >= 25 &&
       !!previewTemplate
     );
   }
@@ -753,7 +1202,7 @@ export default function AlliancePanel({
     setErr(null);
     if (!name.trim()) return setErr("name required");
     if (!pendingRect) return setErr("draw a rectangle on the map");
-    if (pendingRect.width < 5 || pendingRect.height < 5) return setErr("min size 5×5");
+    if (pendingRect.width < 3 || pendingRect.height < 3 || pendingRect.width * pendingRect.height < 25) return setErr("min 3×3, area ≥ 25 cells");
     if (!previewTemplate) return setErr("upload an image");
     setBusy(true);
     try {
@@ -785,7 +1234,7 @@ export default function AlliancePanel({
     setErr(null);
     if (!myAlliance) return;
     if (!pendingRect) return setErr("draw the new (larger) rectangle");
-    if (pendingRect.width < 5 || pendingRect.height < 5) return setErr("min size 5×5");
+    if (pendingRect.width < 3 || pendingRect.height < 3 || pendingRect.width * pendingRect.height < 25) return setErr("min 3×3, area ≥ 25 cells");
     if (!previewTemplate) return setErr("upload the new image");
     // Client-side containment check — backend re-validates anyway, but
     // catching it here avoids a wasted round-trip and a confusing error.
@@ -922,39 +1371,14 @@ export default function AlliancePanel({
         </div>
       )}
       <div style={styles.header}>
-        <h3 style={styles.title}>⚔ Alliances</h3>
-        <span style={{ fontSize: 11, color: C.textMuted }}>
-          {alliances.length} active
-        </span>
+        <h3 style={styles.title}>Your Alliance</h3>
       </div>
-
-      {/* Tab strip */}
-      <div
-        style={{
-          display: "flex",
-          borderBottom: `1px solid ${C.border}`,
-          background: C.bg,
-        }}
-      >
-        {(["mine", "leaderboard"] as const).map((t) => (
-          <button
-            key={t}
-            onClick={() => setTab(t)}
-            style={{
-              flex: 1,
-              background: "transparent",
-              border: "none",
-              borderBottom:
-                tab === t ? `2px solid ${C.accent}` : "2px solid transparent",
-              color: tab === t ? C.text : C.textDim,
-              padding: "10px 8px",
-              fontSize: 12,
-              fontWeight: 600,
-              cursor: "pointer",
-              letterSpacing: 0.3,
-              textTransform: "uppercase",
-            }}
-          >
+      {/* Tab strip intentionally removed — only one view now lives here
+          (leaderboard is on the dashboard). Keeping the state + setter
+          props unchanged so any callers still passing `tab` don't break. */}
+      <div style={{ display: "none" }}>
+        {(["mine"] as const).map((t) => (
+          <button key={t} onClick={() => setTab(t)}>
             {t === "mine" ? "Your alliance" : "Leaderboard"}
           </button>
         ))}
@@ -1097,32 +1521,68 @@ export default function AlliancePanel({
             {/* NFT badge — appears once the backend has minted the mission's
                 NFT to the leader. Clicking opens the canister's HTTP image
                 endpoint in a new tab. */}
+            {nftSuccess && (
+              <div
+                style={{
+                  padding: "8px 10px",
+                  marginBottom: 10,
+                  background: "rgba(126,237,86,0.08)",
+                  border: "1px solid rgba(126,237,86,0.3)",
+                  borderRadius: 6,
+                  fontSize: 12,
+                  color: "#7eed56",
+                  lineHeight: 1.5,
+                }}
+              >
+                {renderMsgWithLinks(nftSuccess)}
+              </div>
+            )}
             {myAlliance.nft_token_id.length > 0 && (() => {
               const tokenId = myAlliance.nft_token_id[0]!;
               return (
-              <a
-                href={nftImageUrl(tokenId)}
-                target="_blank"
-                rel="noopener noreferrer"
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 8,
-                  padding: "8px 10px",
-                  marginBottom: 10,
-                  background: "linear-gradient(135deg,#3a2a06,#5a4108)",
-                  border: `1px solid #b88a1f`,
-                  borderRadius: 6,
-                  color: "#ffd76a",
-                  fontWeight: 700,
-                  fontSize: 13,
-                  textDecoration: "none",
-                }}
-                title="Open the NFT image in a new tab"
-              >
-                <span style={{ fontSize: 16 }}>🏆</span>
-                <span>NFT #{String(tokenId)} minted</span>
-              </a>
+              <div style={{ display: "flex", alignItems: "stretch", gap: 6, marginBottom: 10 }}>
+                <a
+                  href={nftImageUrl(tokenId)}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  style={{
+                    flex: 1,
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 8,
+                    padding: "8px 10px",
+                    background: "linear-gradient(135deg,#3a2a06,#5a4108)",
+                    border: `1px solid #b88a1f`,
+                    borderRadius: 6,
+                    color: "#ffd76a",
+                    fontWeight: 700,
+                    fontSize: 13,
+                    textDecoration: "none",
+                  }}
+                  title="Open the NFT image in a new tab"
+                >
+                  <span style={{ fontSize: 16 }}>🏆</span>
+                  <span>NFT #{String(tokenId)} minted</span>
+                </a>
+                {isLeader && (
+                  <button
+                    onClick={() => { setNftTransferToken(tokenId); setErr(null); }}
+                    style={{
+                      padding: "8px 12px",
+                      background: "#1f1f25",
+                      color: "#ffd76a",
+                      border: "1px solid #b88a1f",
+                      borderRadius: 6,
+                      fontSize: 12,
+                      fontWeight: 700,
+                      cursor: "pointer",
+                    }}
+                    title="Transfer the NFT to another wallet"
+                  >
+                    transfer
+                  </button>
+                )}
+              </div>
               );
             })()}
             {myAlliance.nft_mint_in_progress && myAlliance.nft_token_id.length === 0 && (
@@ -1222,10 +1682,10 @@ export default function AlliancePanel({
                     ? `${pendingRect.width}×${pendingRect.height} @ (${pendingRect.x}, ${-pendingRect.y})`
                     : "draw a rectangle"}
                 </div>
-                <div style={{ display: pendingRect && pendingRect.width >= 5 && pendingRect.height >= 5 ? "block" : "none" }}>
+                <div style={{ display: pendingRect && pendingRect.width >= 3 && pendingRect.height >= 3 && pendingRect.width * pendingRect.height >= 25 ? "block" : "none" }}>
                   <MissionImageCrop
-                    gridW={pendingRect?.width ?? 5}
-                    gridH={pendingRect?.height ?? 5}
+                    gridW={pendingRect?.width ?? 3}
+                    gridH={pendingRect?.height ?? 3}
                     onTemplate={setCropTemplate}
                     accent={C.accent}
                     border={C.border}
@@ -1313,7 +1773,7 @@ export default function AlliancePanel({
                   <span
                     style={{
                       color:
-                        pendingRect.width >= 5 && pendingRect.height >= 5
+                        pendingRect.width >= 3 && pendingRect.height >= 3 && pendingRect.width * pendingRect.height >= 25
                           ? C.green
                           : C.red,
                       fontWeight: 600,
@@ -1321,7 +1781,10 @@ export default function AlliancePanel({
                   >
                     {pendingRect.width}×{pendingRect.height} @ ({pendingRect.x},
                     {pendingRect.y})
-                    {(pendingRect.width < 5 || pendingRect.height < 5) && " — min 5×5"}
+                    {(pendingRect.width < 3 ||
+                      pendingRect.height < 3 ||
+                      pendingRect.width * pendingRect.height < 25) &&
+                      " — min 3×3, area ≥ 25"}
                   </span>
                 ) : (
                   <span style={{ color: C.textMuted }}>
@@ -1334,7 +1797,7 @@ export default function AlliancePanel({
             <div style={styles.step}>
               <div style={styles.stepTitle}>2 · Mission image</div>
               {/* Always mounted so image state survives rect changes. Hidden when rect too small. */}
-              <div style={{ display: pendingRect && pendingRect.width >= 5 && pendingRect.height >= 5 ? "block" : "none" }}>
+              <div style={{ display: pendingRect && pendingRect.width >= 3 && pendingRect.height >= 3 && pendingRect.width * pendingRect.height >= 25 ? "block" : "none" }}>
                 <MissionImageCrop
                   gridW={pendingRect?.width ?? 5}
                   gridH={pendingRect?.height ?? 5}
@@ -1345,7 +1808,7 @@ export default function AlliancePanel({
                   textMuted={C.textMuted}
                 />
               </div>
-              {!(pendingRect && pendingRect.width >= 5 && pendingRect.height >= 5) && (
+              {!(pendingRect && pendingRect.width >= 3 && pendingRect.height >= 3 && pendingRect.width * pendingRect.height >= 25) && (
                 <div style={{ fontSize: 11, color: C.textMuted, opacity: 0.5 }}>
                   draw the mission area first (step 1)
                 </div>
@@ -1362,7 +1825,12 @@ export default function AlliancePanel({
               }}
               title="Alliance creation fee — paid once on submit"
             >
-              Cost: {(Number(priceE8s) / 1e8).toFixed(2)} ICP
+              {pricePixels === 0n ? "Free" : `Cost: ${String(pricePixels)} pixels`}
+              {nextPrice !== null && (
+                <span style={{ color: C.textMuted, fontWeight: 400 }}>
+                  {" "}(next will cost {String(nextPrice)})
+                </span>
+              )}
             </div>
             <button
               onClick={handleCreate}
@@ -1377,12 +1845,56 @@ export default function AlliancePanel({
             </button>
           </div>
         ) : (
+          <>
           <button
             onClick={() => setCreating(true)}
             style={{ ...styles.primaryBtn, marginBottom: 14 }}
           >
             + create alliance
           </button>
+
+          {/* List of existing alliances the user can join */}
+          {alliances.length > 0 && (
+            <>
+              <div style={{ fontSize: 11, color: C.textMuted, marginBottom: 8, textTransform: "uppercase", letterSpacing: 0.5, fontWeight: 600 }}>
+                or join an existing alliance
+              </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 14 }}>
+                {alliances.map((a) => (
+                  <div
+                    key={String(a.id)}
+                    style={{
+                      display: "flex", alignItems: "center", justifyContent: "space-between",
+                      padding: "8px 10px", background: C.bgElev, border: `1px solid ${C.border}`,
+                      borderRadius: 6,
+                    }}
+                  >
+                    <div style={{ minWidth: 0 }}>
+                      <div style={{ fontSize: 12, fontWeight: 700, color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        {a.name}
+                      </div>
+                      <div style={{ fontSize: 10, color: C.textMuted }}>
+                        {a.member_count} member{a.member_count === 1 ? "" : "s"} · {String(a.pixels_captured)} px
+                      </div>
+                    </div>
+                    <button
+                      disabled={busy}
+                      onClick={() => handleJoin(a.id)}
+                      style={{
+                        padding: "4px 10px", fontSize: 10, fontWeight: 700,
+                        background: "transparent", color: C.accent,
+                        border: `1px solid ${C.accent}`, borderRadius: 4,
+                        cursor: busy ? "wait" : "pointer", flexShrink: 0, marginLeft: 8,
+                      }}
+                    >
+                      join
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+          </>
         )}
 
         {err && (
@@ -1404,92 +1916,149 @@ export default function AlliancePanel({
         </>
        )}
 
-       {tab === "leaderboard" && (
-        <>
-          <div style={{ fontSize: 11, color: C.textMuted, marginBottom: 10 }}>
-            {lbTotal} alliance{lbTotal === 1 ? "" : "s"} ranked by pixels captured
-            {lbLoading && " · loading..."}
-          </div>
-
-          {/* Sticky "your rank" row when off-page. */}
-          {lbMyEntry &&
-            !lbEntries.some(
-              (e) => e.alliance.id === lbMyEntry.alliance.id
-            ) && (
-              <>
-                <div
-                  style={{
-                    fontSize: 10,
-                    color: C.textMuted,
-                    textTransform: "uppercase",
-                    letterSpacing: 1,
-                    marginBottom: 4,
-                  }}
-                >
-                  Your rank
-                </div>
-                <LbRow
-                  entry={lbMyEntry}
-                  topPixels={lbTopPixels}
-                  isMine
-                  myAlliance={myAlliance}
-                  busy={busy}
-                  onJoin={handleJoin}
-                />
-                <div style={{ height: 10 }} />
-              </>
-            )}
-
-          {lbEntries.length === 0 && !lbLoading && (
-            <div style={{ color: C.textMuted, fontSize: 12, padding: "8px 0" }}>
-              No alliances yet — be the first.
-            </div>
-          )}
-
-          {lbEntries.map((e) => (
-            <LbRow
-              key={String(e.alliance.id)}
-              entry={e}
-              topPixels={lbTopPixels}
-              isMine={
-                lbMyEntry !== null &&
-                e.alliance.id === lbMyEntry.alliance.id
-              }
-              myAlliance={myAlliance}
-              busy={busy}
-              onJoin={handleJoin}
-            />
-          ))}
-
-          {lbEntries.length > 0 && lbEntries.length < lbTotal && (
-            <button
-              onClick={() => fetchLeaderboard(lbEntries.length + LB_PAGE_SIZE)}
-              disabled={lbLoading}
-              style={{
-                width: "100%",
-                marginTop: 8,
-                padding: "8px",
-                background: C.bgElev,
-                border: `1px solid ${C.border}`,
-                borderRadius: 6,
-                color: C.text,
-                fontSize: 12,
-                cursor: "pointer",
-              }}
-            >
-              {lbLoading
-                ? "loading..."
-                : `load more (${lbEntries.length} / ${lbTotal})`}
-            </button>
-          )}
-
-          {/* Suppress unused warnings on `sortedAlliances` while we keep
-              the array around for any future fallback rendering. */}
-          {void sortedAlliances}
-        </>
-       )}
       </div>
     </div>
+
+    {nftTransferToken !== null && (
+      <div
+        onClick={() => { if (!nftBusy) setNftTransferToken(null); }}
+        style={{
+          position: "fixed",
+          inset: 0,
+          background: "rgba(0,0,0,0.65)",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          zIndex: 100,
+        }}
+      >
+        <div
+          onClick={(e) => e.stopPropagation()}
+          style={{
+            background: "#16161a",
+            border: "1px solid #2a2a32",
+            borderRadius: 10,
+            padding: 20,
+            width: 380,
+            maxWidth: "92vw",
+            color: "#e8e8ec",
+            boxShadow: "0 20px 60px rgba(0,0,0,0.6)",
+          }}
+        >
+          <div style={{ fontSize: 16, fontWeight: 800, marginBottom: 6 }}>
+            Transfer NFT #{String(nftTransferToken)}
+          </div>
+          <div style={{ fontSize: 12, color: "#9090a0", marginBottom: 14 }}>
+            Choose where the NFT should land. ICRC-7 only supports ICRC-1
+            destinations (Principal + optional Subaccount).
+          </div>
+
+          <div style={{ fontSize: 11, color: "#6a6a76", marginBottom: 4, fontWeight: 600 }}>
+            ADDRESS FORMAT
+          </div>
+          <select
+            value={nftFormat}
+            onChange={(e) => pickNftFormat(e.target.value as "principal" | "icrc1")}
+            disabled={nftBusy}
+            style={{
+              width: "100%",
+              padding: "10px 12px",
+              marginBottom: 12,
+              background: "#1f1f25",
+              color: "#e8e8ec",
+              border: "1px solid #2a2a32",
+              borderRadius: 6,
+              fontSize: 13,
+              cursor: nftBusy ? "wait" : "pointer",
+              appearance: "none",
+              WebkitAppearance: "none",
+            }}
+          >
+            <option value="principal">Principal (Plug, Oisy, NFID)</option>
+            <option value="icrc1">Principal + Subaccount (ICRC-1)</option>
+          </select>
+
+          <div style={{ fontSize: 11, color: "#6a6a76", marginBottom: 4, fontWeight: 600 }}>
+            PRINCIPAL (destination wallet)
+          </div>
+          <input
+            value={nftAddr}
+            onChange={(e) => setNftAddr(e.target.value)}
+            placeholder="e.g. jeebz-3aaaa-aaaai-axjfa-cai"
+            style={inputStyle}
+            spellCheck={false}
+          />
+          {nftFormat === "icrc1" && (
+            <>
+              <div style={{ fontSize: 11, color: "#6a6a76", marginBottom: 4, fontWeight: 600, marginTop: 8 }}>
+                SUBACCOUNT (optional, 64 hex chars)
+              </div>
+              <input
+                value={nftSub}
+                onChange={(e) => setNftSub(e.target.value)}
+                placeholder="leave empty for default subaccount"
+                style={inputStyle}
+                spellCheck={false}
+              />
+            </>
+          )}
+
+          <div
+            style={{
+              fontSize: 11,
+              color: "#f0c040",
+              background: "rgba(240,192,64,0.08)",
+              border: "1px solid rgba(240,192,64,0.3)",
+              padding: 10,
+              borderRadius: 6,
+              margin: "12px 0 14px",
+              lineHeight: 1.5,
+            }}
+          >
+            ⚠ NFT transfers are permanent. Double-check the destination.
+          </div>
+
+          {err && (
+            <div style={{ fontSize: 12, color: "#ff8080", marginBottom: 10 }}>{err}</div>
+          )}
+
+          <button
+            disabled={nftBusy}
+            onClick={() => { if (nftTransferToken !== null) runNftTransfer(nftTransferToken); }}
+            style={{
+              width: "100%",
+              padding: "10px",
+              background: nftBusy ? "#9090a0" : "#f0c040",
+              color: "#16161a",
+              border: "none",
+              borderRadius: 6,
+              fontSize: 14,
+              fontWeight: 800,
+              cursor: nftBusy ? "wait" : "pointer",
+              marginBottom: 8,
+            }}
+          >
+            {nftBusy ? "transferring…" : "Transfer NFT"}
+          </button>
+          <button
+            disabled={nftBusy}
+            onClick={() => setNftTransferToken(null)}
+            style={{
+              width: "100%",
+              padding: 8,
+              background: "transparent",
+              color: "#9090a0",
+              border: "1px solid #2a2a32",
+              borderRadius: 6,
+              fontSize: 12,
+              cursor: "pointer",
+            }}
+          >
+            Cancel
+          </button>
+        </div>
+      </div>
+    )}
     </>
   );
 }

@@ -176,7 +176,16 @@ export const idlFactory = ({ IDL }) => {
     'order_id_hex' : IDL.Text,
   });
   const Result_3 = IDL.Variant({ 'Ok' : OrderView, 'Err' : IDL.Text });
+  const PayoutDestArg = IDL.Variant({
+    'Icrc1' : IDL.Record({
+      'subaccount_hex' : IDL.Opt(IDL.Text),
+      'owner' : IDL.Principal,
+    }),
+    'Default' : IDL.Null,
+    'AccountId' : IDL.Record({ 'hex' : IDL.Text }),
+  });
   const ClaimResult = IDL.Record({
+    'block_index' : IDL.Opt(IDL.Nat64),
     'transferred' : IDL.Bool,
     'share_e8s' : IDL.Nat64,
   });
@@ -234,6 +243,10 @@ export const idlFactory = ({ IDL }) => {
     'Full' : Alliance,
     'Public' : AlliancePublic,
   });
+  const AlliancePriceInfo = IDL.Record({
+    'next' : IDL.Opt(IDL.Nat64),
+    'current' : IDL.Nat64,
+  });
   const ChangesResponse = IDL.Record({
     'min_version' : IDL.Nat64,
     'next_version' : IDL.Nat64,
@@ -266,6 +279,11 @@ export const idlFactory = ({ IDL }) => {
     'id' : IDL.Nat8,
     'pixels' : IDL.Nat64,
     'price_e8s' : IDL.Nat64,
+  });
+  const TreasuryAddress = IDL.Record({
+    'subaccount_hex' : IDL.Text,
+    'account_identifier_hex' : IDL.Text,
+    'owner_principal' : IDL.Principal,
   });
   const VersionInfo = IDL.Record({
     'version' : IDL.Nat64,
@@ -404,8 +422,12 @@ export const idlFactory = ({ IDL }) => {
     'check_mission' : IDL.Func([IDL.Nat64], [Result_2], ['query']),
     'check_order' : IDL.Func([IDL.Text], [Result_3], []),
     'chunk_size' : IDL.Func([], [IDL.Nat16], ['query']),
-    'claim_mission_reward' : IDL.Func([IDL.Nat64, IDL.Nat32], [Result_4], []),
-    'claim_treasury' : IDL.Func([], [Result], []),
+    'claim_mission_reward' : IDL.Func(
+        [IDL.Nat64, IDL.Nat32, PayoutDestArg],
+        [Result_4],
+        [],
+      ),
+    'claim_treasury' : IDL.Func([PayoutDestArg], [Result], []),
     'create_alliance' : IDL.Func(
         [IDL.Text, IDL.Text, Mission, IDL.Text],
         [Result_5],
@@ -421,6 +443,7 @@ export const idlFactory = ({ IDL }) => {
         ['query'],
       ),
     'get_alliance_billing' : IDL.Func([], [Billing], ['query']),
+    'get_alliance_price_pixels' : IDL.Func([], [AlliancePriceInfo], ['query']),
     'get_changes_since' : IDL.Func(
         [IDL.Nat64, IDL.Opt(IDL.Nat64)],
         [ChangesResponse],
@@ -448,6 +471,7 @@ export const idlFactory = ({ IDL }) => {
     'get_packs' : IDL.Func([], [IDL.Vec(PixelPack)], ['query']),
     'get_pixel_credits' : IDL.Func([IDL.Principal], [IDL.Nat64], ['query']),
     'get_snapshot_reader' : IDL.Func([], [IDL.Opt(IDL.Principal)], ['query']),
+    'get_treasury_address' : IDL.Func([], [TreasuryAddress], ['query']),
     'get_treasury_balance' : IDL.Func([], [IDL.Nat64], ['query']),
     'get_version' : IDL.Func([], [VersionInfo], ['query']),
     'get_wallet_pending_e8s' : IDL.Func([], [IDL.Nat64], ['query']),

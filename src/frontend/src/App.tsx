@@ -193,7 +193,7 @@ export default function App() {
   const wrapperRef = useRef<HTMLDivElement>(null);
 
   // ── Screen routing ───────────────────────────────────────────────
-  type Screen = "game" | "dashboard" | "admin" | "alliances" | "profile";
+  type Screen = "game" | "dashboard" | "admin" | "alliances" | "profile" | "my-nfts";
   const [screen, setScreen] = useState<Screen>("game");
   // Ref mirror so global event handlers can read the current screen
   // without being re-created on every screen switch.
@@ -203,6 +203,29 @@ export default function App() {
   const [actor, setActor] = useState<BackendActor | null>(null);
   const [principal, setPrincipal] = useState<string | null>(null);
   const [state, setState] = useState<GameState | null>(null);
+  // True when the logged-in user owns at least one NFT on our canister.
+  // Drives visibility of the "My NFTs" tab in the nav bar.
+  const [hasNfts, setHasNfts] = useState(false);
+  useEffect(() => {
+    if (!principal) { setHasNfts(false); return; }
+    let stop = false;
+    (async () => {
+      try {
+        const { makeNftActor } = await import("./api");
+        const { Principal } = await import("@dfinity/principal");
+        const nft = await makeNftActor();
+        const ids = await nft.icrc7_tokens_of(
+          { owner: Principal.fromText(principal), subaccount: [] },
+          [],
+          [1n], // just need to know if ≥1
+        );
+        if (!stop) setHasNfts(Array.from(ids).length > 0);
+      } catch {
+        if (!stop) setHasNfts(false);
+      }
+    })();
+    return () => { stop = true; };
+  }, [principal]);
   const [map, setMap] = useState<number[] | null>(null);
   // ── Replay mode ───────────────────────────────────────────────────
   // When active, the map you see is reconstructed from the change-log up
@@ -433,18 +456,21 @@ export default function App() {
   // created. Kept separate from global `status` so unrelated status
   // messages (cooldown, "ready", etc) don't leak into the shop modal.
   const [shopError, setShopError] = useState<string | null>(null);
-  // Wallet format the buyer chose before generating the deposit address.
-  // Drives which format OrderModal displays (simpler one-address UI per
-  // wallet type, instead of showing all three). Persisted in localStorage
-  // so returning users don't re-pick each purchase.
-  type WalletType = "account_id" | "icrc1";
-  const [walletType, setWalletTypeState] = useState<WalletType>(() => {
-    const saved = typeof window !== "undefined" ? localStorage.getItem("icpixel.walletType") : null;
-    return saved === "icrc1" ? "icrc1" : "account_id";
+  // Address format the buyer chose before generating the deposit address.
+  // The three formats are different slices of the same destination:
+  //   account_id — single 64-char hex (NNS, Coinbase, Binance, exchanges)
+  //   principal  — canister principal (must be paired with subaccount)
+  //   subaccount — 32-byte hex subaccount (must be paired with principal)
+  // Persisted in localStorage so returning users don't re-pick each time.
+  type AddressFormat = "account_id" | "principal" | "subaccount";
+  const [addressFormat, setAddressFormatState] = useState<AddressFormat>(() => {
+    const saved = typeof window !== "undefined" ? localStorage.getItem("icpixel.addressFormat") : null;
+    if (saved === "principal" || saved === "subaccount") return saved;
+    return "account_id";
   });
-  const setWalletType = useCallback((t: WalletType) => {
-    setWalletTypeState(t);
-    try { localStorage.setItem("icpixel.walletType", t); } catch {}
+  const setAddressFormat = useCallback((t: AddressFormat) => {
+    setAddressFormatState(t);
+    try { localStorage.setItem("icpixel.addressFormat", t); } catch {}
   }, []);
 
   const refreshCredits = useCallback(async () => {
@@ -536,33 +562,6 @@ export default function App() {
     setOrderError(null);
   }
 
-  // ── Mission template overlay ──────────────────────────────────────
-  // A separate canvas that paints the alliance's mission template at its
-  // intrinsic pixel size (mission.width × mission.height). It's then CSS-
-  // scaled in the JSX below to match the on-screen mission rect and laid
-  // over the main map at low opacity, so the leader sees what to draw.
-  // Costs nothing — template is already on the client.
-  const missionOverlayRef = useRef<HTMLCanvasElement>(null);
-  useEffect(() => {
-    const canvas = missionOverlayRef.current;
-    if (!canvas || !myAlliance) return;
-    const m = myAlliance.mission;
-    canvas.width = m.width;
-    canvas.height = m.height;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    const img = ctx.createImageData(m.width, m.height);
-    const tpl = m.template as Array<number | bigint>;
-    for (let i = 0; i < tpl.length; i++) {
-      const c = Number(tpl[i]);
-      img.data[i * 4 + 0] = (c >> 16) & 0xff;
-      img.data[i * 4 + 1] = (c >> 8) & 0xff;
-      img.data[i * 4 + 2] = c & 0xff;
-      img.data[i * 4 + 3] = 255;
-    }
-    ctx.putImageData(img, 0, 0);
-  }, [myAlliance]);
-
   // ── Mission progress (matched/total over current map) ─────────────
   const missionProgress = useMemo(() => {
     if (!map || !myAlliance || !state) return null;
@@ -583,17 +582,38 @@ export default function App() {
   // ── Global mission completion banner ───────────────────────────────
   // Shows "Alliance X completed their mission!" to ALL players when any
   // alliance's NFT is minted. Detects by comparing last_completed_mission_at
-  // in GameState across polls.
+  // in GameState across polls. The "last seen" timestamp is persisted in
+  // localStorage so the banner fires once per completion across the whole
+  // fleet of reloads — not every time the player opens the page.
+  const MISSION_BANNER_KEY = "icpixel.lastSeenMissionAt";
   const [missionBanner, setMissionBanner] = useState<string | null>(null);
-  const lastSeenCompletionRef = useRef<bigint>(0n);
+  const lastSeenCompletionRef = useRef<bigint>(
+    (() => {
+      try {
+        const raw = localStorage.getItem(MISSION_BANNER_KEY);
+        return raw ? BigInt(raw) : 0n;
+      } catch {
+        return 0n;
+      }
+    })()
+  );
   useEffect(() => {
     if (!state) return;
     const at = state.last_completed_mission_at?.[0] ?? 0n;
     const name = state.last_completed_mission_name?.[0] ?? null;
     if (at > 0n && at > lastSeenCompletionRef.current && name) {
       lastSeenCompletionRef.current = at;
-      setMissionBanner(name);
-      window.setTimeout(() => setMissionBanner(null), 8000);
+      try { localStorage.setItem(MISSION_BANNER_KEY, at.toString()); } catch {}
+      // Only show if the completion is fresh (within the last 20 min). Stale
+      // completions — e.g. a mission finished hours ago that a new visitor
+      // is seeing for the first time — are silently marked "seen" above so
+      // they never fire the banner here or on any later reload.
+      const nowNs = BigInt(Date.now()) * 1_000_000n;
+      const FRESH_NS = 20n * 60n * 1_000_000_000n; // 20 min in ns
+      if (nowNs - at <= FRESH_NS) {
+        setMissionBanner(name);
+        window.setTimeout(() => setMissionBanner(null), 8000);
+      }
     }
   }, [state?.last_completed_mission_at?.[0]]);
 
@@ -1504,6 +1524,9 @@ export default function App() {
   }
 
   async function handleClick(e: React.MouseEvent<HTMLCanvasElement>) {
+    // On mobile, pixel placement goes through handleTouchTap (via
+    // useTouchCanvas). Skip the click handler to avoid double-fire.
+    if (isMobile) return;
     if (!actor || !state || !map) return;
     if (e.shiftKey) return;
     if (growing) return;
@@ -1602,20 +1625,36 @@ export default function App() {
 
   async function doPlacePixel(px: number, py: number, color: number) {
     if (!actor || !state || !map) return;
+
+    // Client-side credit gate: if we know the player has no credits, don't
+    // even try to paint optimistically — just shake the counter, play the
+    // error sound, and bail. Avoids the flash where the cell paints and
+    // then gets rolled back after the backend says NoCredits.
+    if (authed && pixelCredits === 0n) {
+      shakePixelCounter();
+      playError();
+      setStatus("Out of pixel credits — buy more to continue");
+      return;
+    }
+
     const idx = cellToIdx(px, py, state.map_size);
     const prev = map[idx];
     const next = [...map];
     next[idx] = color;
     setMap(next);
+    // Optimistic credit decrement so the top counter reflects the spend
+    // immediately. Backend-authoritative value comes back via refreshCredits
+    // after the call, which also catches any drift.
+    const hadCredits = pixelCredits;
+    if (authed && pixelCredits > 0n) {
+      setPixelCredits(pixelCredits - 1n);
+    }
     setStatus(`placing (${px},${py})...`);
     // Arm the cooldown EAGERLY, before the await — so any clicks fired during
     // the 1-2s round-trip to the backend hit the gate. We'll roll it back to
     // the previous value if the backend rejects.
     const prevCooldownUntil = cooldownUntilRef.current;
     setCooldownUntil(Date.now() + COOLDOWN_MS);
-    // Play the click sound now (synchronously, while we still have a fresh
-    // user gesture). If the backend rejects, we'll play an error sound below.
-    playPlacePixel();
 
     try {
       const res = await actor.place_pixel(px, py, color);
@@ -1627,6 +1666,8 @@ export default function App() {
           r[idx] = prev;
           return r;
         });
+        // Roll back the optimistic credit decrement.
+        setPixelCredits(hadCredits);
         const err = res.Err as PlaceError;
         console.error("[place_pixel] backend rejected at", { px, py }, "→", err);
         if ("Cooldown" in err) {
@@ -1648,12 +1689,17 @@ export default function App() {
             "InternalError" in err ? "Something went wrong: " + err.InternalError :
             JSON.stringify(err);
           setStatus(label);
+          if ("NoCredits" in err) shakePixelCounter();
         }
         playError();
-      shake();
+        shake();
         return;
       }
       setStatus("ready");
+      // Pull the authoritative credit balance after success — no-op if our
+      // optimistic decrement was already right, but catches drift if the
+      // backend ever changes what one placement costs.
+      void refreshCredits();
       // Cooldown was already armed eagerly before the await — nothing to do.
       bumpStreak();
       bumpPersonalBest();
@@ -2076,6 +2122,13 @@ export default function App() {
     setShakeKey((k) => k + 1);
   }
 
+  // Separate shake for the top PIXEL counter — fires when the user tries
+  // to place with 0 credits. Bumps a key that restarts the CSS animation.
+  const [pixelShakeKey, setPixelShakeKey] = useState(0);
+  function shakePixelCounter() {
+    setPixelShakeKey((k) => k + 1);
+  }
+
   function bumpStreak() {
     try {
       const today = todayKey();
@@ -2263,6 +2316,8 @@ export default function App() {
           <span className="nav-spacer" />
           {screen === "game" && !replayMode && (
             <button
+              key={`pxm-${pixelShakeKey}`}
+              className={pixelShakeKey > 0 ? "pixel-counter-shake" : undefined}
               onClick={() => setShopOpen(true)}
               style={{
                 display: "flex",
@@ -2311,6 +2366,8 @@ export default function App() {
         {/* Pixel credits — centered */}
         {screen === "game" && !replayMode && (
           <button
+            key={`pxd-${pixelShakeKey}`}
+            className={pixelShakeKey > 0 ? "pixel-counter-shake" : undefined}
             onClick={() => setShopOpen(true)}
             title="Buy pixel credits"
             style={{
@@ -2472,6 +2529,7 @@ export default function App() {
       {screen === "admin" && actor && (
         <AdminPanel actor={actor} onClose={() => setScreen("game")} />
       )}
+
 
       {/* ── Game screen ── (canvas + palette + replay + alliances panel)
            Hidden via CSS instead of unmounting so refs (canvas, wrapper)
@@ -2782,7 +2840,6 @@ export default function App() {
                     Buy pixel credits. Each credit = 1 pixel.
                   </div>
                   {([
-                    { id: 0, count: 10, icp: "0.001" },
                     { id: 1, count: 100, icp: "2" },
                     { id: 2, count: 500, icp: "5" },
                     { id: 3, count: 1000, icp: "8" },
@@ -2868,15 +2925,15 @@ export default function App() {
                         <span style={{ color: "#f0c040", fontWeight: 700 }}>
                           {shopDepositPack.icp} ICP
                         </span>
-                        . Pick your wallet type below to get the right address format.
+                        . Pick the address format your wallet expects.
                       </div>
 
                       <div style={{ fontSize: 11, color: "#6a6a76", marginBottom: 4, fontWeight: 600 }}>
-                        WHICH WALLET ARE YOU USING?
+                        ADDRESS FORMAT
                       </div>
                       <select
-                        value={walletType}
-                        onChange={(e) => setWalletType(e.target.value as "account_id" | "icrc1")}
+                        value={addressFormat}
+                        onChange={(e) => setAddressFormat(e.target.value as "account_id" | "principal" | "subaccount")}
                         disabled={shopBusy}
                         style={{
                           width: "100%",
@@ -2897,8 +2954,9 @@ export default function App() {
                           paddingRight: 34,
                         }}
                       >
-                        <option value="account_id">NNS • Coinbase • Binance • Kraken • exchanges</option>
-                        <option value="icrc1">Plug • Oisy • NFID • ICRC-1 wallets</option>
+                        <option value="account_id">Account ID</option>
+                        <option value="principal">Principal (ICRC-1)</option>
+                        <option value="subaccount">Subaccount (ICRC-1)</option>
                       </select>
 
                       {shopError && !shopBusy && (
@@ -2974,7 +3032,7 @@ export default function App() {
             order={activeOrder}
             view={orderView}
             error={orderError}
-            walletType={walletType}
+            addressFormat={addressFormat}
             onClose={closeActiveOrder}
             isMobile={isMobile}
           />
@@ -4074,14 +4132,14 @@ function OrderModal({
   order,
   view,
   error,
-  walletType,
+  addressFormat,
   onClose,
   isMobile,
 }: {
   order: OrderCreated;
   view: OrderView | null;
   error: string | null;
-  walletType: "account_id" | "icrc1";
+  addressFormat: "account_id" | "principal" | "subaccount";
   onClose: () => void;
   isMobile: boolean;
 }) {
@@ -4223,115 +4281,71 @@ function OrderModal({
               from your wallet to the address below.
             </div>
 
-            {walletType === "account_id" ? (
-              // ── Account ID view — one address for NNS, Coinbase, exchanges
-              <>
-                <div style={{ fontSize: 11, color: "#6a6a76", marginBottom: 4, marginTop: 2, fontWeight: 600 }}>
-                  ACCOUNT ID (NNS, Coinbase, Binance, exchanges)
-                </div>
-                <div
-                  style={{
-                    fontSize: 11,
-                    color: "#c8c8d0",
-                    background: "#1b1b22",
-                    padding: 10,
-                    borderRadius: 6,
-                    marginBottom: 6,
-                    wordBreak: "break-all",
-                    fontFamily: "ui-monospace, monospace",
-                  }}
-                >
-                  {order.account_identifier_hex}
-                </div>
-                <button
-                  onClick={() => copy("accid", order.account_identifier_hex)}
-                  style={{
-                    width: "100%",
-                    padding: 8,
-                    marginBottom: 14,
-                    background: "transparent",
-                    color: "#e8e8ec",
-                    border: "1px solid #3a3a42",
-                    borderRadius: 6,
-                    fontSize: 12,
-                    cursor: "pointer",
-                  }}
-                >
-                  {copied === "accid" ? "✓ copied" : "Copy Account ID"}
-                </button>
-              </>
-            ) : (
-              // ── ICRC-1 view — principal + subaccount for Plug, Oisy, NFID
-              <>
-                <div style={{ fontSize: 11, color: "#6a6a76", marginBottom: 4, marginTop: 2, fontWeight: 600 }}>
-                  PRINCIPAL (paste as "To" / "Owner" in your wallet)
-                </div>
-                <div
-                  style={{
-                    fontSize: 11,
-                    color: "#c8c8d0",
-                    background: "#1b1b22",
-                    padding: 10,
-                    borderRadius: 6,
-                    marginBottom: 6,
-                    wordBreak: "break-all",
-                    fontFamily: "ui-monospace, monospace",
-                  }}
-                >
-                  {ownerPrincipalStr}
-                </div>
-                <button
-                  onClick={() => copy("principal", ownerPrincipalStr)}
-                  style={{
-                    width: "100%",
-                    padding: 8,
-                    marginBottom: 10,
-                    background: "transparent",
-                    color: "#e8e8ec",
-                    border: "1px solid #3a3a42",
-                    borderRadius: 6,
-                    fontSize: 12,
-                    cursor: "pointer",
-                  }}
-                >
-                  {copied === "principal" ? "✓ copied" : "Copy Principal"}
-                </button>
-
-                <div style={{ fontSize: 11, color: "#6a6a76", marginBottom: 4, fontWeight: 600 }}>
-                  SUBACCOUNT (paste in the "Subaccount" field)
-                </div>
-                <div
-                  style={{
-                    fontSize: 11,
-                    color: "#c8c8d0",
-                    background: "#1b1b22",
-                    padding: 10,
-                    borderRadius: 6,
-                    marginBottom: 6,
-                    wordBreak: "break-all",
-                    fontFamily: "ui-monospace, monospace",
-                  }}
-                >
-                  {order.subaccount_hex}
-                </div>
-                <button
-                  onClick={() => copy("subaccount", order.subaccount_hex)}
-                  style={{
-                    width: "100%",
-                    padding: 8,
-                    marginBottom: 14,
-                    background: "transparent",
-                    color: "#e8e8ec",
-                    border: "1px solid #3a3a42",
-                    borderRadius: 6,
-                    fontSize: 12,
-                    cursor: "pointer",
-                  }}
-                >
-                  {copied === "subaccount" ? "✓ copied" : "Copy Subaccount"}
-                </button>
-              </>
-            )}
+            {(() => {
+              // One selected format per modal. Each block renders exactly
+              // the field the buyer asked for in the dropdown, plus a help
+              // line explaining what "To" field to paste it in.
+              const label =
+                addressFormat === "account_id" ? "ACCOUNT ID"
+                : addressFormat === "principal" ? "PRINCIPAL"
+                : "SUBACCOUNT";
+              const value =
+                addressFormat === "account_id" ? order.account_identifier_hex
+                : addressFormat === "principal" ? ownerPrincipalStr
+                : order.subaccount_hex;
+              const copyKey =
+                addressFormat === "account_id" ? "accid"
+                : addressFormat === "principal" ? "principal"
+                : "subaccount";
+              const copyLabel =
+                addressFormat === "account_id" ? "Copy Account ID"
+                : addressFormat === "principal" ? "Copy Principal"
+                : "Copy Subaccount";
+              const hint =
+                addressFormat === "account_id" ? "Paste as the recipient in NNS, Coinbase, Binance, or any exchange."
+                : addressFormat === "principal" ? "Paste in the \"Principal\" / \"Owner\" / \"To\" field in Plug, Oisy, NFID."
+                : "Paste in the \"Subaccount\" field. ICRC-1 transfers also require the Principal — switch the dropdown to copy it.";
+              return (
+                <>
+                  <div style={{ fontSize: 11, color: "#6a6a76", marginBottom: 4, marginTop: 2, fontWeight: 600 }}>
+                    {label}
+                  </div>
+                  <div
+                    style={{
+                      fontSize: 11,
+                      color: "#c8c8d0",
+                      background: "#1b1b22",
+                      padding: 10,
+                      borderRadius: 6,
+                      marginBottom: 6,
+                      wordBreak: "break-all",
+                      fontFamily: "ui-monospace, monospace",
+                    }}
+                  >
+                    {value}
+                  </div>
+                  <button
+                    onClick={() => copy(copyKey, value)}
+                    style={{
+                      width: "100%",
+                      padding: 8,
+                      marginBottom: 8,
+                      background: "transparent",
+                      color: "#e8e8ec",
+                      border: "1px solid #3a3a42",
+                      borderRadius: 6,
+                      fontSize: 12,
+                      cursor: "pointer",
+                    }}
+                  >
+                    {copied === copyKey ? "✓ copied" : copyLabel}
+                  </button>
+                  <div style={{ fontSize: 11, color: "#7a7a88", marginBottom: 14, lineHeight: 1.5 }}>
+                    {hint}
+                  </div>
+                </>
+              );
+            })()}
 
             {/* Warnings */}
             <div

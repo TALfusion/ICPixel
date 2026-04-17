@@ -340,10 +340,13 @@ pub struct MissionContributionView {
 pub struct ClaimResult {
     pub share_e8s: u64,
     /// Whether the e8s were actually transferred to the caller's wallet.
-    /// Currently always `false` — Phase 1 implements bookkeeping only;
-    /// real ICRC-1 transfers ship in Phase 2 alongside the rest of the
-    /// payment plumbing.
+    /// `false` in free mode (share_e8s == 0 or ledger not wired); `true`
+    /// on a successful `drain_to_dest`.
     pub transferred: bool,
+    /// ICP ledger block index of the transfer, when `transferred == true`.
+    /// Frontend builds a dashboard.internetcomputer.org link from this.
+    #[serde(default)]
+    pub block_index: Option<u64>,
 }
 
 // ───── Mission tile-bucket spatial index ─────

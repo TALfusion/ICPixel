@@ -67,31 +67,55 @@ fn mint(args: MintArgs) -> Result<TokenId, MintError> {
     // Stamp the canonical token id into the metadata.
     metadata.global_nft_number = id;
 
+    let now = ic_cdk::api::time();
     let token = Token {
         id,
-        owner: Some(to),
-        minted_at: ic_cdk::api::time(),
+        owner: Some(to.clone()),
+        minted_at: now,
         metadata,
     };
     TOKENS.with(|t| t.borrow_mut().insert(id, token));
+    state::log_tx(types::TxRecord {
+        kind: types::TxKind::Mint,
+        timestamp: now,
+        token_id: id,
+        from: None,
+        to: Some(to),
+        memo: None,
+    });
     Ok(id)
 }
 
 #[update]
 fn burn(token_id: TokenId) -> Result<(), BurnError> {
     let caller = ic_cdk::caller();
-    TOKENS.with(|t| {
+    let prev_owner = TOKENS.with(|t| {
         let mut map = t.borrow_mut();
         let mut tok = map.get(&token_id).ok_or(BurnError::NotFound)?;
-        match &tok.owner {
+        let owner_acc = match &tok.owner {
             None => return Err(BurnError::AlreadyBurned),
             Some(acc) if acc.owner != caller => return Err(BurnError::NotOwner),
-            Some(_) => {}
-        }
+            Some(acc) => {
+                let owner_sub = acc.subaccount.unwrap_or([0u8; 32]);
+                if owner_sub != [0u8; 32] {
+                    return Err(BurnError::NotOwner);
+                }
+                acc.clone()
+            }
+        };
         tok.owner = None;
         map.insert(token_id, tok);
-        Ok(())
-    })
+        Ok(owner_acc)
+    })?;
+    state::log_tx(types::TxRecord {
+        kind: types::TxKind::Burn,
+        timestamp: ic_cdk::api::time(),
+        token_id,
+        from: Some(prev_owner),
+        to: None,
+        memo: None,
+    });
+    Ok(())
 }
 
 // ───── ICRC-7 surface ─────
@@ -175,6 +199,100 @@ fn icrc7_token_metadata(ids: Vec<TokenId>) -> Vec<Option<Vec<(String, Value)>>> 
 #[update]
 fn icrc7_transfer(args: Vec<TransferArg>) -> Vec<Option<TransferResult>> {
     icrc7::transfer(ic_cdk::caller(), args)
+}
+
+// ───── ICRC-10: Supported Standards ─────
+//
+// Wallets like Oisy use this endpoint to auto-detect that our canister
+// speaks ICRC-7 (and optionally ICRC-37 for approvals). Without it,
+// the "Import NFT collection" flow fails with "can't detect standard".
+
+#[derive(candid::CandidType, serde::Serialize)]
+struct SupportedStandard {
+    name: String,
+    url: String,
+}
+
+#[query]
+fn icrc10_supported_standards() -> Vec<SupportedStandard> {
+    supported_standards()
+}
+
+/// ICRC-7 mandates this as part of the base standard. Some wallets
+/// (Oisy) check this instead of ICRC-10.
+#[query]
+fn icrc7_supported_standards() -> Vec<SupportedStandard> {
+    supported_standards()
+}
+
+fn supported_standards() -> Vec<SupportedStandard> {
+    vec![
+        SupportedStandard {
+            name: "ICRC-7".into(),
+            url: "https://github.com/dfinity/ICRC/blob/main/ICRCs/ICRC-7/ICRC-7.md".into(),
+        },
+        SupportedStandard {
+            name: "ICRC-3".into(),
+            url: "https://github.com/dfinity/ICRC/blob/main/ICRCs/ICRC-3/ICRC-3.md".into(),
+        },
+        SupportedStandard {
+            name: "ICRC-10".into(),
+            url: "https://github.com/dfinity/ICRC/blob/main/ICRCs/ICRC-10/ICRC-10.md".into(),
+        },
+    ]
+}
+
+// ───── ICRC-3: Transaction log ─────
+
+use crate::types::{GetTransactionsResponse, Icrc3Transaction, SupportedBlockType};
+
+/// Paginated transaction history. `start` is the first tx index to return,
+/// `length` is max number of entries. Returns newest-first within the window.
+#[query]
+fn icrc3_get_transactions(start: u64, length: u64) -> GetTransactionsResponse {
+    let total = state::tx_count();
+    let capped = length.min(2000); // cap per-request
+    let mut txs = Vec::new();
+    state::TX_LOG.with(|m| {
+        let map = m.borrow();
+        for i in start..start.saturating_add(capped) {
+            if i >= total { break; }
+            if let Some(rec) = map.get(&i) {
+                txs.push(Icrc3Transaction {
+                    id: i,
+                    kind: rec.kind,
+                    timestamp: rec.timestamp,
+                    token_id: rec.token_id,
+                    from: rec.from,
+                    to: rec.to,
+                    memo: rec.memo,
+                });
+            }
+        }
+    });
+    GetTransactionsResponse {
+        log_length: total,
+        transactions: txs,
+    }
+}
+
+/// Block types we emit in the log.
+#[query]
+fn icrc3_supported_block_types() -> Vec<SupportedBlockType> {
+    vec![
+        SupportedBlockType {
+            block_type: "7mint".into(),
+            url: "https://github.com/dfinity/ICRC/blob/main/ICRCs/ICRC-7/ICRC-7.md".into(),
+        },
+        SupportedBlockType {
+            block_type: "7xfer".into(),
+            url: "https://github.com/dfinity/ICRC/blob/main/ICRCs/ICRC-7/ICRC-7.md".into(),
+        },
+        SupportedBlockType {
+            block_type: "7burn".into(),
+            url: "https://github.com/dfinity/ICRC/blob/main/ICRCs/ICRC-7/ICRC-7.md".into(),
+        },
+    ]
 }
 
 // ───── Treasury distribution support ─────
@@ -265,6 +383,8 @@ fn post_upgrade() {
     TOKENS.with(|t| t.borrow().len());
     state::NEXT_TOKEN_ID.with(|c| *c.borrow().get());
     let _ = backend_principal();
+    state::TX_LOG.with(|m| m.borrow().len());
+    state::NEXT_TX_ID.with(|c| *c.borrow().get());
 }
 
 // Hand-written did is the source of truth — see `nft.did`.

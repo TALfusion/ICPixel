@@ -4,12 +4,14 @@
 //!   MEM 0 — TOKENS:           StableBTreeMap<TokenId, Token>
 //!   MEM 1 — NEXT_TOKEN_ID:    StableCell<TokenId>          (next id to mint)
 //!   MEM 2 — BACKEND_PRINCIPAL: StableCell<Option<Principal>> (auth for mint)
+//!   MEM 3 — TX_LOG:           StableBTreeMap<u64, TxRecord> (ICRC-3 transaction log)
+//!   MEM 4 — NEXT_TX_ID:       StableCell<u64>              (next tx index)
 //!
 //! Owner index is *not* persisted — it's a derived view, rebuilt lazily on
 //! demand. Token count is small relative to lookups (rebuilds are cheap and
 //! avoid a second source of truth that could drift).
 
-use crate::types::{Token, TokenId};
+use crate::types::{Token, TokenId, TxRecord};
 use candid::Principal;
 use ic_stable_structures::memory_manager::{MemoryId, MemoryManager, VirtualMemory};
 use ic_stable_structures::{DefaultMemoryImpl, StableBTreeMap, StableCell};
@@ -20,6 +22,8 @@ pub type Memory = VirtualMemory<DefaultMemoryImpl>;
 const MEM_TOKENS: MemoryId = MemoryId::new(0);
 const MEM_NEXT_TOKEN_ID: MemoryId = MemoryId::new(1);
 const MEM_BACKEND_PRINCIPAL: MemoryId = MemoryId::new(2);
+const MEM_TX_LOG: MemoryId = MemoryId::new(3);
+const MEM_NEXT_TX_ID: MemoryId = MemoryId::new(4);
 
 thread_local! {
     static MEMORY_MANAGER: RefCell<MemoryManager<DefaultMemoryImpl>> =
@@ -43,6 +47,20 @@ thread_local! {
             MEMORY_MANAGER.with(|m| m.borrow().get(MEM_BACKEND_PRINCIPAL)),
             PrincipalCell(None),
         ).expect("init BACKEND_PRINCIPAL"),
+    );
+
+    /// ICRC-3 transaction log. Append-only: mint/transfer/burn events.
+    pub static TX_LOG: RefCell<StableBTreeMap<u64, TxRecord, Memory>> = RefCell::new(
+        StableBTreeMap::init(
+            MEMORY_MANAGER.with(|m| m.borrow().get(MEM_TX_LOG)),
+        ),
+    );
+
+    pub static NEXT_TX_ID: RefCell<StableCell<u64, Memory>> = RefCell::new(
+        StableCell::init(
+            MEMORY_MANAGER.with(|m| m.borrow().get(MEM_NEXT_TX_ID)),
+            0u64,
+        ).expect("init NEXT_TX_ID"),
     );
 }
 
@@ -92,4 +110,22 @@ pub fn next_token_id() -> Result<TokenId, String> {
             .map(|_| cur)
             .map_err(|e| format!("set NEXT_TOKEN_ID: {e:?}"))
     })
+}
+
+/// Append a transaction to the ICRC-3 log. Returns the tx index.
+pub fn log_tx(record: TxRecord) -> u64 {
+    let idx = NEXT_TX_ID.with(|c| {
+        let cur = *c.borrow().get();
+        c.borrow_mut()
+            .set(cur + 1)
+            .unwrap_or_else(|e| ic_cdk::trap(&format!("NEXT_TX_ID write failed: {e:?}")));
+        cur
+    });
+    TX_LOG.with(|m| m.borrow_mut().insert(idx, record));
+    idx
+}
+
+/// Total number of transactions logged.
+pub fn tx_count() -> u64 {
+    NEXT_TX_ID.with(|c| *c.borrow().get())
 }

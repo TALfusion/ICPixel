@@ -189,3 +189,19 @@ export async function makeActor(identity?: Identity): Promise<BackendActor> {
     canisterId,
   });
 }
+
+// NFT canister — separate ICRC-7 canister used for mission NFTs. Frontend
+// needs direct access for the post-mint "transfer to my real wallet" flow,
+// because the owner (caller) must sign the `icrc7_transfer` themselves.
+import { idlFactory as nftIdlFactory, type _SERVICE as NftActor } from "../../declarations/nft/nft.did.js";
+
+const nftCanisterId = import.meta.env.VITE_NFT_CANISTER_ID as string | undefined;
+
+export async function makeNftActor(identity?: Identity): Promise<NftActor> {
+  if (!nftCanisterId) throw new Error("VITE_NFT_CANISTER_ID not set");
+  const agent = await makeAgent(identity);
+  return Actor.createActor<NftActor>(nftIdlFactory, {
+    agent,
+    canisterId: nftCanisterId,
+  });
+}

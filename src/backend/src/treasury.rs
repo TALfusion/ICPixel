@@ -70,7 +70,12 @@ fn weight_for(pixel_count: u64, rank: u32, total: u32) -> u128 {
     let size = isqrt((pixel_count as u128) * 1_000_000_000_000);
     // age_mult = 1 + (1 - rank/total), scaled by 1e6.
     // = (2*total - rank) / total, scaled by 1e6
-    let age = (2 * total as u128 - rank as u128) * 1_000_000 / total as u128;
+    let rank128 = rank as u128;
+    let total128 = total as u128;
+    if rank128 >= 2 * total128 {
+        return 0; // safety: rank should never exceed total, but clamp to avoid underflow
+    }
+    let age = (2 * total128 - rank128) * 1_000_000 / total128;
     // weight = size * age / 1e6 (remove one scale factor)
     size * age / 1_000_000
 }
@@ -228,7 +233,10 @@ pub async fn distribute_treasury(
 /// balance via a single `icrc1_transfer`. The ledger fee is taken out of
 /// the credited amount (so the user pays it, not the canister). On
 /// transfer failure the credit is restored so the user can retry.
-pub async fn claim_treasury(caller: Principal) -> Result<u64, String> {
+pub async fn claim_treasury(
+    caller: Principal,
+    dest: crate::icp_ledger::PayoutDest,
+) -> Result<u64, String> {
     if caller == Principal::anonymous() {
         return Err("anonymous caller cannot claim".into());
     }
@@ -251,10 +259,12 @@ pub async fn claim_treasury(caller: Principal) -> Result<u64, String> {
     if credit == 0 {
         return Err("nothing to claim".into());
     }
-    // `transfer_drain` handles fee subtraction + BadFee retry. On failure
-    // we restore the credit so the user can retry without losing funds.
-    match crate::icp_ledger::transfer_drain(ledger, caller, credit).await {
-        Ok(amount) => Ok(amount),
+    // `drain_to_dest` handles fee subtraction + BadFee retry, and routes
+    // to legacy `transfer` or `icrc1_transfer` based on the destination
+    // format the caller chose. We only need the net amount here; block
+    // index is logged by the caller if they care.
+    match crate::icp_ledger::drain_to_dest(ledger, &dest, credit).await {
+        Ok((amount, _idx)) => Ok(amount),
         Err(e) => {
             CLAIMABLE_TREASURY.with(|m| {
                 m.borrow_mut().insert(caller, credit);

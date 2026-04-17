@@ -57,6 +57,8 @@ type AllianceError = variant {
   AlreadyInAlliance;
 };
 type AllianceOrPublic = variant { Full : Alliance; Public : AlliancePublic };
+// Alliance creation cost: current price + next tier price (if any).
+type AlliancePriceInfo = record { next : opt nat64; current : nat64 };
 // Public view (no mission) — what non-members see in `list_alliances`.
 type AlliancePublic = record {
   id : nat64;
@@ -132,10 +134,12 @@ type ChangesResponse = record {
 };
 // Result of a successful `claim_mission_reward` call.
 type ClaimResult = record {
+  // ICP ledger block index of the transfer, when `transferred == true`.
+  // Frontend builds a dashboard.internetcomputer.org link from this.
+  block_index : opt nat64;
   // Whether the e8s were actually transferred to the caller's wallet.
-  // Currently always `false` — Phase 1 implements bookkeeping only;
-  // real ICRC-1 transfers ship in Phase 2 alongside the rest of the
-  // payment plumbing.
+  // `false` in free mode (share_e8s == 0 or ledger not wired); `true`
+  // on a successful `drain_to_dest`.
   transferred : bool;
   share_e8s : nat64;
 };
@@ -406,6 +410,18 @@ type OrderView = record {
   expires_at_ns : nat64;
   order_id_hex : text;
 };
+// Frontend-facing payout destination. The typed ICRC-1 variant carries
+// subaccount as a hex string for ergonomics (JS has no 32-byte array
+// literal); backend parses it before calling the ledger.
+type PayoutDestArg = variant {
+  // ICRC-1 destination. `subaccount_hex` optional; when given must be
+  // exactly 64 hex chars (32 bytes).
+  Icrc1 : record { subaccount_hex : opt text; owner : principal };
+  // Send to the caller's Internet Identity principal, default subaccount.
+  Default;
+  // Legacy 32-byte AccountIdentifier as a 64-char hex string.
+  AccountId : record { hex : text };
+};
 type PendingOrder = record {
   status : OrderStatus;
   "principal" : principal;
@@ -457,6 +473,15 @@ type Result_6 = variant { Ok : OrderCreated; Err : text };
 type Result_7 = variant { Ok : DistributeReport; Err : text };
 type Result_8 = variant { Ok; Err : AllianceError };
 type Result_9 = variant { Ok : MissionContributionView; Err : AllianceError };
+// Public view of the treasury's deposit address in all three formats.
+// Open query so admins can display it and anyone who wants to donate
+// directly to treasury can use it. The destination is
+// `billing.treasury_principal`'s default subaccount.
+type TreasuryAddress = record {
+  subaccount_hex : text;
+  account_identifier_hex : text;
+  owner_principal : principal;
+};
 // Per-user streak stats. Stored in `USER_STATS` stable map (MemoryId 16).
 // Updated on every `place_pixel`: if the player placed yesterday →
 // current_streak += 1; if they skipped a day → reset to 1.
@@ -521,8 +546,6 @@ service : () -> {
   admin_export_user_stats : (nat64, nat64) -> (
       vec record { principal; UserStats },
     ) query;
-  admin_set_snapshot_reader : (opt principal) -> (Result_1);
-  get_snapshot_reader : () -> (opt principal) query;
   // Controller-only. Grants free credits to a player — used during testing.
   // On mainnet with the real ledger wired, players will call `buy_pixels`
   // instead and this endpoint becomes dev-only.
@@ -553,6 +576,7 @@ service : () -> {
   // upgrade_mission, ...) return `Paused`. Query endpoints stay open so
   // clients can still read state and display a maintenance banner.
   admin_set_paused : (bool) -> (Result_1);
+  admin_set_snapshot_reader : (opt principal) -> (Result_1);
   // Controller-only. Override the operational ICP buffer (e8s) the
   // canister keeps on hand instead of distributing.
   admin_set_treasury_buffer : (nat64) -> (Result_1);
@@ -564,11 +588,11 @@ service : () -> {
   // call from any caller (order_id is an unguessable 128-bit capability).
   check_order : (text) -> (Result_3);
   chunk_size : () -> (nat16) query;
-  claim_mission_reward : (nat64, nat32) -> (Result_4);
+  claim_mission_reward : (nat64, nat32, PayoutDestArg) -> (Result_4);
   // User-facing pull. Drains the caller's claimable share from the
   // season distribution into their account via `icrc1_transfer`. The
   // ledger fee is taken from the credited amount.
-  claim_treasury : () -> (Result);
+  claim_treasury : (PayoutDestArg) -> (Result);
   create_alliance : (text, text, Mission, text) -> (Result_5);
   // Create a deposit order for the given pack. Rejects anonymous callers.
   // Returns the deposit address (owner + subaccount in both ICRC-1 and
@@ -586,6 +610,7 @@ service : () -> {
   get_admin_stats : () -> (AdminStats) query;
   get_alliance : (nat64) -> (opt AllianceOrPublic) query;
   get_alliance_billing : () -> (Billing) query;
+  get_alliance_price_pixels : () -> (AlliancePriceInfo) query;
   get_changes_since : (nat64, opt nat64) -> (ChangesResponse) query;
   get_claimable_treasury : (principal) -> (nat64) query;
   get_game_state : () -> (GameState) query;
@@ -597,6 +622,8 @@ service : () -> {
   // Query the available pixel packs and their prices.
   get_packs : () -> (vec PixelPack) query;
   get_pixel_credits : (principal) -> (nat64) query;
+  get_snapshot_reader : () -> (opt principal) query;
+  get_treasury_address : () -> (TreasuryAddress) query;
   get_treasury_balance : () -> (nat64) query;
   get_version : () -> (VersionInfo) query;
   get_wallet_pending_e8s : () -> (nat64) query;

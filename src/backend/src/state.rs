@@ -402,6 +402,20 @@ pub fn reset_wallet_pending() -> Result<(), String> {
     })
 }
 
+/// Subtract a specific amount from wallet-pending instead of resetting
+/// to zero. Prevents losing shares credited between the snapshot read
+/// and the post-transfer write.
+pub fn debit_wallet_pending(amount: u64) -> Result<(), String> {
+    WALLET_PENDING_E8S.with(|c| {
+        let cur = *c.borrow().get();
+        let new_val = cur.saturating_sub(amount);
+        c.borrow_mut()
+            .set(new_val)
+            .map(|_| ())
+            .map_err(|e| format!("debit WALLET_PENDING_E8S: {e:?}"))
+    })
+}
+
 // ───── Mission round accessors ─────
 //
 // All reads/writes to ALLIANCE_ROUNDS go through these helpers so callers

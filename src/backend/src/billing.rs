@@ -88,6 +88,9 @@ impl Storable for OrderId {
 pub enum OrderStatus {
     /// Waiting for the player to send ICP to the deposit subaccount.
     Pending,
+    /// Sweep in progress — guards against concurrent `settle_order` calls.
+    /// Reverts to `Pending` on failure.
+    Settling,
     /// Balance on the subaccount reached the expected amount (within
     /// tolerance); funds have been swept to the canister's main account,
     /// pixels credited, and split done.
@@ -161,7 +164,6 @@ pub fn account_identifier_hex(principal: Principal, subaccount: [u8; 32]) -> Str
 /// inside `buy_pack`. To change prices, update here and redeploy.
 pub fn packs() -> Vec<PixelPack> {
     vec![
-        PixelPack { id: 0, pixels: 10,   price_e8s:     100_000 },  // 0.001 ICP
         PixelPack { id: 1, pixels: 100,  price_e8s: 200_000_000 },  // 2 ICP
         PixelPack { id: 2, pixels: 500,  price_e8s: 500_000_000 },  // 5 ICP
         PixelPack { id: 3, pixels: 1000, price_e8s: 800_000_000 },  // 8 ICP
@@ -325,39 +327,54 @@ pub fn set_price(e8s: u64) -> Result<(), String> {
     })
 }
 
-/// Tiered alliance pricing: 1st free, 2nd $3, 3rd $5, 4th $7, 5th+ $10.
-/// Uses the current alliance count (NEXT_ALLIANCE_ID - 1) to determine tier.
-/// Returns the USD price in cents for the Nth alliance (0-indexed).
-pub fn alliance_price_usd_cents(alliance_count: u64) -> u16 {
+/// Alliance creation cost in pixel credits. Tiered pricing encourages
+/// early alliance formation while scaling up over time.
+pub fn alliance_price_pixels(alliance_count: u64) -> u64 {
     match alliance_count {
-        0 => 0,      // 1st alliance: free
-        1 => 300,    // 2nd: $3
-        2 => 500,    // 3rd: $5
-        3 => 700,    // 4th: $7
-        _ => 1000,   // 5th+: $10
+        0 => 0,       // 1st: free
+        1 => 50,      // 2nd: 50
+        2 => 100,     // 3rd: 100
+        3 => 500,     // 4th: 500
+        4 => 1000,    // 5th: 1000
+        _ => 1500,    // 6th+: 1500
     }
 }
 
-/// Charge a caller for creating an alliance. Tiered pricing:
-/// 1st free, 2nd $3, 3rd $5, 4th $7, 5th+ $10.
-///
-/// Returns `Ok(())` if the alliance is free (1st one). For paid tiers,
-/// converts USD to e8s via cached ICP/USD rate and charges via ICRC-2.
+/// Next tier price (what the NEXT alliance will cost after the current one).
+/// Returns None if already at max tier (1500).
+pub fn alliance_next_price_pixels(alliance_count: u64) -> Option<u64> {
+    match alliance_count {
+        0 => Some(50),
+        1 => Some(100),
+        2 => Some(500),
+        3 => Some(1000),
+        4 => Some(1500),
+        _ => None, // already at max
+    }
+}
+
+/// Charge a caller for creating an alliance by deducting pixel credits.
+/// Returns `Ok(())` on success, `PaymentFailed` if not enough credits.
 pub async fn charge_alliance_fee(caller: Principal) -> Result<(), AllianceError> {
-    let cfg = get();
+    if caller == Principal::anonymous() {
+        return Err(AllianceError::Unauthorized);
+    }
     let count = crate::state::NEXT_ALLIANCE_ID.with(|c| *c.borrow().get()) - 1;
-    let cents = alliance_price_usd_cents(count);
-    if cents == 0 {
+    let cost = alliance_price_pixels(count);
+    if cost == 0 {
         return Ok(());
     }
-    let total_e8s = crate::icp_price::cents_to_e8s(cents).ok_or_else(|| {
-        AllianceError::PaymentFailed(
-            "ICP/USD rate not cached — admin must call refresh_icp_price".into(),
-        )
-    })?;
-    charge_and_split(&cfg, caller, total_e8s)
-        .await
-        .map_err(AllianceError::PaymentFailed)
+    crate::state::PIXEL_CREDITS.with(|m| {
+        let had = m.borrow().get(&caller).unwrap_or(0);
+        if had < cost {
+            return Err(AllianceError::PaymentFailed(format!(
+                "Need {} pixel credits to create an alliance, you have {}",
+                cost, had
+            )));
+        }
+        m.borrow_mut().insert(caller, had - cost);
+        Ok(())
+    })
 }
 
 /// Core charge path used by `charge_alliance_fee` (ICRC-2 approve + pull).
@@ -429,7 +446,7 @@ pub async fn settle_order(order_id: OrderId) -> Result<OrderStatus, String> {
         .with(|m| m.borrow().get(&order_id))
         .ok_or_else(|| format!("order {} not found", order_id.hex()))?;
 
-    // Already terminal? No-op.
+    // Already terminal or being settled concurrently? No-op.
     if !matches!(order.status, OrderStatus::Pending) {
         return Ok(order.status);
     }
@@ -444,39 +461,81 @@ pub async fn settle_order(order_id: OrderId) -> Result<OrderStatus, String> {
         return Ok(o.status);
     }
 
+    // Set Settling sentinel before any async call to prevent concurrent
+    // settle_order calls from double-sweeping the same subaccount.
+    {
+        let mut o = order.clone();
+        o.status = OrderStatus::Settling;
+        PENDING_ORDERS.with(|m| m.borrow_mut().insert(order_id, o));
+    }
+
     let cfg = get();
-    let ledger = cfg
-        .ledger
-        .ok_or_else(|| "ledger not configured".to_string())?;
+    let ledger = match cfg.ledger {
+        Some(l) => l,
+        None => {
+            // Revert to Pending on failure.
+            let mut o = order;
+            o.status = OrderStatus::Pending;
+            PENDING_ORDERS.with(|m| m.borrow_mut().insert(order_id, o));
+            return Err("ledger not configured".to_string());
+        }
+    };
     let subaccount = order_subaccount(order_id);
-    let balance = crate::icp_ledger::balance_of_subaccount(
+    let balance = match crate::icp_ledger::balance_of_subaccount(
         ledger,
         ic_cdk::api::id(),
         subaccount,
     )
-    .await?;
+    .await
+    {
+        Ok(b) => b,
+        Err(e) => {
+            // Revert to Pending on failure.
+            let mut o = order;
+            o.status = OrderStatus::Pending;
+            PENDING_ORDERS.with(|m| m.borrow_mut().insert(order_id, o));
+            return Err(e);
+        }
+    };
 
     // Need at least expected - tolerance. Overpayment (balance > expected)
     // is fine and will flow into treasury as excess.
     let min_e8s = order.expected_e8s.saturating_sub(UNDER_TOLERANCE_E8S);
     if balance < min_e8s {
+        // Revert Settling → Pending (not yet paid enough).
+        let mut o = order;
+        o.status = OrderStatus::Pending;
+        PENDING_ORDERS.with(|m| m.borrow_mut().insert(order_id, o));
         return Ok(OrderStatus::Pending);
     }
 
     // Sweep subaccount → canister's default account (minus ledger fee).
     let fee = crate::icp_ledger::cached_ledger_fee();
     if balance <= fee {
-        // Can't sweep — deposit is dust. Leave as Pending until TTL.
+        // Can't sweep — deposit is dust. Revert Settling → Pending until TTL.
+        let mut o = order;
+        o.status = OrderStatus::Pending;
+        PENDING_ORDERS.with(|m| m.borrow_mut().insert(order_id, o));
         return Ok(OrderStatus::Pending);
     }
     let sweep_amount = balance - fee;
-    let block_index = crate::icp_ledger::transfer_from_subaccount(
+    let block_index = match crate::icp_ledger::transfer_from_subaccount(
         ledger,
         subaccount,
         ic_cdk::api::id(),
         sweep_amount,
     )
-    .await?;
+    .await
+    {
+        Ok(idx) => idx,
+        Err(e) => {
+            // Sweep failed — revert Settling → Pending so player can retry.
+            let mut o = order;
+            o.status = OrderStatus::Pending;
+            PENDING_ORDERS.with(|m| m.borrow_mut().insert(order_id, o));
+            return Err(e);
+        }
+    };
 
     // Split: pack_portion goes through normal wallet/treasury/reward_pool
     // split; excess over the pack price is lumped fully into treasury.

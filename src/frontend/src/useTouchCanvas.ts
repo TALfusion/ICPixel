@@ -1,4 +1,5 @@
 import { useEffect, useRef } from "react";
+import { unlockAudio } from "./sound";
 
 export interface UseTouchCanvasOptions {
   wrapperRef: React.RefObject<HTMLDivElement>;
@@ -91,6 +92,12 @@ export function useTouchCanvas(opts: UseTouchCanvasOptions) {
     function onTouchStart(e: TouchEvent) {
       if (growingRef.current) return;
       e.preventDefault();
+
+      // Resume AudioContext on every touch — this IS a real user gesture,
+      // unlike the setTimeout-deferred onTap callback. Mobile browsers
+      // re-suspend the context after ~10s of silence, so we must resume
+      // on each new interaction, not just once.
+      unlockAudio();
 
       stopInertia();
       clearTapTimer();

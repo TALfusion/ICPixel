@@ -108,6 +108,41 @@
   animation: hover-shake 0.35s ease-in-out;
 }
 
+/* Top PIXEL counter shake — fires when the player tries to place with
+   zero credits. Uses transform so it composes with the button's existing
+   `translateX(-50%)` centering on desktop. */
+@keyframes pixel-counter-shake {
+  0%, 100% { transform: translateX(-50%); }
+  15%      { transform: translateX(calc(-50% - 6px)); }
+  30%      { transform: translateX(calc(-50% + 6px)); }
+  45%      { transform: translateX(calc(-50% - 4px)); }
+  60%      { transform: translateX(calc(-50% + 4px)); }
+  75%      { transform: translateX(calc(-50% - 2px)); }
+  90%      { transform: translateX(calc(-50% + 2px)); }
+}
+@keyframes pixel-counter-shake-flat {
+  0%, 100% { transform: translateX(0); }
+  15%      { transform: translateX(-6px); }
+  30%      { transform: translateX(6px); }
+  45%      { transform: translateX(-4px); }
+  60%      { transform: translateX(4px); }
+  75%      { transform: translateX(-2px); }
+  90%      { transform: translateX(2px); }
+}
+.pixel-counter-shake {
+  animation: pixel-counter-shake 0.45s ease-in-out, counter-flash 0.45s ease-in-out;
+}
+/* Mobile version doesn't have translateX(-50%) — use the flat shake. */
+@media (max-width: 720px) {
+  .pixel-counter-shake {
+    animation: pixel-counter-shake-flat 0.45s ease-in-out, counter-flash 0.45s ease-in-out;
+  }
+}
+@keyframes counter-flash {
+  0%, 100% { border-color: #2a2a32; background: #1a1a20; }
+  50%      { border-color: #ff6b6b; background: #2a1a1f; }
+}
+
 /* Mission rect — gentle pulse so it's findable on a busy map. */
 @keyframes mission-pulse {
   0%, 100% { opacity: 0.55; }
